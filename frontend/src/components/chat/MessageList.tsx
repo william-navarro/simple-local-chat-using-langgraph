@@ -22,8 +22,8 @@ export function MessageList({ messages }: MessageListProps) {
           <div className="flex items-center justify-center w-16 h-16 rounded-2xl bg-zinc-800 border border-zinc-700 mx-auto mb-4">
             <span className="text-3xl">💬</span>
           </div>
-          <p className="text-zinc-400 text-sm font-medium">Como posso ajudar?</p>
-          <p className="text-zinc-600 text-xs mt-1">Digite uma mensagem para comecar</p>
+          <p className="text-zinc-400 text-sm font-medium">How can I help?</p>
+          <p className="text-zinc-600 text-xs mt-1">Type a message to get started</p>
         </div>
       </div>
     )

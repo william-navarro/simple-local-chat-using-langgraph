@@ -20,17 +20,17 @@ export function DeleteDialog({ open, onConfirm, onCancel }: DeleteDialogProps) {
     <AlertDialog open={open} onOpenChange={(v) => !v && onCancel()}>
       <AlertDialogContent className="bg-zinc-900 border-zinc-700">
         <AlertDialogHeader>
-          <AlertDialogTitle className="text-white">Deletar conversa</AlertDialogTitle>
+          <AlertDialogTitle className="text-white">Delete conversation</AlertDialogTitle>
           <AlertDialogDescription className="text-zinc-400">
-            Esta acao nao pode ser desfeita. O historico desta conversa sera removido permanentemente.
+            This action cannot be undone. The conversation history will be permanently removed.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel onClick={onCancel} className="bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700">
-            Cancelar
+            Cancel
           </AlertDialogCancel>
           <AlertDialogAction onClick={onConfirm} className="bg-red-600 hover:bg-red-700 text-white">
-            Deletar
+            Delete
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

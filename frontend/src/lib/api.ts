@@ -1,12 +1,16 @@
-import type { ChatRequest, StreamEvent } from "../types"
+import type { ChatRequest, StreamEvent, TerminalResult } from "../types"
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 
-export async function* streamChat(request: ChatRequest): AsyncGenerator<StreamEvent> {
+export async function* streamChat(
+  request: ChatRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
   const response = await fetch(`${BASE_URL}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
+    signal,
   })
 
   if (!response.ok) {
@@ -50,17 +54,35 @@ export async function generateTitle(message: string, model: string): Promise<str
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, model }),
     })
-    if (!res.ok) {
-      console.error("[generateTitle] API error:", res.status, await res.text())
-      return ""
-    }
+    if (!res.ok) return ""
     const data = await res.json()
-    console.log("[generateTitle] Response:", data)
     return data.title ?? ""
-  } catch (e) {
-    console.error("[generateTitle] Fetch error:", e)
+  } catch {
     return ""
   }
+}
+
+export async function executeTerminalCommand(
+  command: string,
+  workingDirectory = ".",
+): Promise<TerminalResult & { status: string; message?: string }> {
+  const res = await fetch(`${BASE_URL}/chat/terminal/execute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command, working_directory: workingDirectory }),
+  })
+  if (!res.ok) {
+    return {
+      status: "error",
+      command,
+      exit_code: -1,
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      message: `Backend error: ${res.status}`,
+    }
+  }
+  return res.json()
 }
 
 export async function fetchLMStudioStatus(): Promise<boolean> {

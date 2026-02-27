@@ -67,8 +67,8 @@ run.bat
 #### 1. Clone the repository
 
 ```bash
-git clone https://github.com/william-navarro/langgraph-chat.git
-cd langgraph-chat
+git clone https://github.com/william-navarro/simple-local-chat-using-langgraph.git
+cd simple-local-chat-using-langgraph
 ```
 
 #### 2. Start LM Studio
@@ -136,7 +136,7 @@ The API will be available at `http://localhost:8000` and docs at `http://localho
 
 #### 4. Setup the frontend
 
-Open a **new terminal** and run:
+Open a **new terminal** in the project folder and run:
 
 ```bash
 cd frontend

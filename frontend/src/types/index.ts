@@ -9,10 +9,20 @@ export interface SearchResult {
   snippet: string
 }
 
+export interface TerminalResult {
+  command: string
+  exit_code: number
+  stdout: string
+  stderr: string
+  truncated: boolean
+}
+
 export interface ToolCallInfo {
   name: string
   query: string
+  command?: string
   results?: SearchResult[]
+  terminalResult?: TerminalResult
   error?: string
 }
 
@@ -47,6 +57,8 @@ export interface StreamEvent {
     | "tool_start"
     | "tool_result"
     | "tool_error"
+    | "terminal_pending"
+    | "compressing"
   content?: string
 }
 
@@ -64,4 +76,5 @@ export interface ChatRequest {
   model: string
   thinking_mode: boolean
   web_search: boolean
+  terminal_access: boolean
 }

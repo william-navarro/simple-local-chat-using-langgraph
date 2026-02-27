@@ -22,10 +22,10 @@ export function ConversationItem({ conversation, isActive }: ConversationItemPro
     const date = new Date(timestamp)
     const now = new Date()
     const diffDays = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24))
-    if (diffDays === 0) return "Hoje"
-    if (diffDays === 1) return "Ontem"
-    if (diffDays < 7) return `${diffDays} dias atras`
-    return date.toLocaleDateString("pt-BR", { day: "2-digit", month: "short" })
+    if (diffDays === 0) return "Today"
+    if (diffDays === 1) return "Yesterday"
+    if (diffDays < 7) return `${diffDays} days ago`
+    return date.toLocaleDateString("en-US", { day: "2-digit", month: "short" })
   }
 
   return (
@@ -46,7 +46,7 @@ export function ConversationItem({ conversation, isActive }: ConversationItemPro
         <button
           onClick={handleDelete}
           className="shrink-0 p-1 rounded transition-colors duration-150 text-zinc-600 hover:text-red-400 hover:bg-zinc-700 opacity-0 group-hover:opacity-100"
-          aria-label="Deletar conversa"
+          aria-label="Delete conversation"
         >
           <Trash2 size={14} />
         </button>

@@ -1,4 +1,4 @@
-import { Brain, Globe, Tag, Bot, User, Copy, Check } from "lucide-react"
+import { Brain, Globe, Terminal, Tag, Bot, User, Copy, Check } from "lucide-react"
 import { useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -12,9 +12,9 @@ interface MessageItemProps {
 }
 
 const messageTypeLabel: Record<string, string> = {
-  simple: "simples",
-  summary_request: "resumo",
-  system_instruction: "instrucao",
+  simple: "simple",
+  summary_request: "summary",
+  system_instruction: "instruction",
 }
 
 const messageTypeColor: Record<string, string> = {
@@ -23,13 +23,13 @@ const messageTypeColor: Record<string, string> = {
   system_instruction: "text-violet-400 bg-violet-900/30",
 }
 
-// normaliza modelos que emitem "Reasoning:" / "Answer:" em texto livre
-// converte para o formato <think>...</think> que o frontend ja sabe renderizar
+// Normalizes models that emit "Reasoning:" / "Answer:" as free text
+// Converts to <think>...</think> format that the frontend already handles
 function normalizeReasoningFormat(raw: string): string {
-  // ja tem tags nativas, nao mexe
+  // Already has native tags, skip
   if (/<think(?:ing)?>/.test(raw)) return raw
 
-  // padrao: **Reasoning:** ... **Answer:** ...  (com ou sem asteriscos, case-insensitive)
+  // Pattern: **Reasoning:** ... **Answer:** ... (with or without asterisks, case-insensitive)
   const pattern = /^\s*\*{0,2}Reasoning:\*{0,2}\s*([\s\S]*?)\s*\*{0,2}Answer:\*{0,2}\s*([\s\S]*)$/i
   const match = pattern.exec(raw)
   if (match) {
@@ -53,10 +53,10 @@ function CopyButton({ text }: { text: string }) {
     <button
       onClick={handleCopy}
       className="flex items-center gap-1 px-2 py-1 rounded text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700 transition-colors duration-150"
-      aria-label="Copiar codigo"
+      aria-label="Copy code"
     >
       {copied ? <Check size={11} /> : <Copy size={11} />}
-      {copied ? "Copiado" : "Copiar"}
+      {copied ? "Copied" : "Copy"}
     </button>
   )
 }
@@ -65,7 +65,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
   return (
     <div className="my-2 rounded-lg overflow-hidden border border-zinc-700 max-w-full">
       <div className="flex items-center justify-between px-3 py-1.5 bg-zinc-900 border-b border-zinc-700">
-        <span className="text-xs text-zinc-500 font-mono">{language || "texto"}</span>
+        <span className="text-xs text-zinc-500 font-mono">{language || "text"}</span>
         <CopyButton text={code} />
       </div>
       <div className="overflow-x-auto">
@@ -198,7 +198,7 @@ function ThinkingBlock({ content, isStreaming }: { content: string; isStreaming:
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-indigo-800/20">
         <Brain size={11} className={`text-indigo-400 ${isStreaming ? "animate-pulse" : ""}`} />
         <span className={`text-xs font-medium tracking-wide ${isStreaming ? "text-indigo-400 animate-pulse" : "text-indigo-500/70"}`}>
-          {isStreaming ? "pensando..." : "raciocinio"}
+          {isStreaming ? "thinking..." : "reasoning"}
         </span>
         {isStreaming && (
           <span className="flex gap-0.5 ml-0.5">
@@ -216,19 +216,22 @@ function ThinkingBlock({ content, isStreaming }: { content: string; isStreaming:
 }
 
 function SearchBlock({ toolCalls }: { toolCalls: ToolCallInfo[] }) {
+  const searchCalls = toolCalls.filter((tc) => tc.name !== "terminal_execute")
+  if (searchCalls.length === 0) return null
+
   return (
     <div className="my-2 rounded-lg bg-blue-950/40 border border-blue-800/30 overflow-hidden">
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-blue-800/20">
         <Globe size={11} className="text-blue-400" />
         <span className="text-xs font-medium tracking-wide text-blue-400">
-          pesquisa web
+          web search
         </span>
       </div>
       <div className="px-3 py-2 space-y-2">
-        {toolCalls.map((tc, i) => (
+        {searchCalls.map((tc, i) => (
           <div key={i}>
             <p className="text-xs text-blue-300/80 italic mb-1">
-              Buscou: &ldquo;{tc.query}&rdquo;
+              Searched: &ldquo;{tc.query}&rdquo;
             </p>
             {tc.results && tc.results.length > 0 && (
               <ul className="space-y-1">
@@ -248,6 +251,58 @@ function SearchBlock({ toolCalls }: { toolCalls: ToolCallInfo[] }) {
                   </li>
                 ))}
               </ul>
+            )}
+            {tc.error && (
+              <p className="text-xs text-red-400/70">{tc.error}</p>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function TerminalBlock({ toolCalls }: { toolCalls: ToolCallInfo[] }) {
+  const terminalCalls = toolCalls.filter((tc) => tc.name === "terminal_execute")
+  if (terminalCalls.length === 0) return null
+
+  return (
+    <div className="my-2 rounded-lg bg-green-950/40 border border-green-800/30 overflow-hidden">
+      <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-green-800/20">
+        <Terminal size={11} className="text-green-400" />
+        <span className="text-xs font-medium tracking-wide text-green-400">
+          terminal
+        </span>
+      </div>
+      <div className="px-3 py-2 space-y-2">
+        {terminalCalls.map((tc, i) => (
+          <div key={i}>
+            <div className="flex items-center gap-1.5 mb-1">
+              <span className="text-xs text-green-300/80 font-mono">
+                $ {tc.command}
+              </span>
+              {tc.terminalResult && (
+                <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${
+                  tc.terminalResult.exit_code === 0
+                    ? "text-green-400 bg-green-900/30"
+                    : "text-red-400 bg-red-900/30"
+                }`}>
+                  exit {tc.terminalResult.exit_code}
+                </span>
+              )}
+            </div>
+            {tc.terminalResult?.stdout && (
+              <pre className="text-xs text-green-200/60 font-mono bg-zinc-900/50 rounded p-2 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
+                {tc.terminalResult.stdout}
+              </pre>
+            )}
+            {tc.terminalResult?.stderr && (
+              <pre className="text-xs text-red-400/70 font-mono bg-zinc-900/50 rounded p-2 overflow-x-auto mt-1 whitespace-pre-wrap">
+                {tc.terminalResult.stderr}
+              </pre>
+            )}
+            {tc.terminalResult?.truncated && (
+              <p className="text-xs text-yellow-500/70 mt-1">Output truncated (exceeded 5000 characters)</p>
             )}
             {tc.error && (
               <p className="text-xs text-red-400/70">{tc.error}</p>
@@ -319,7 +374,7 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
       </div>
 
       <div className={`flex flex-col gap-1 min-w-0 max-w-[75%] ${isUser ? "items-end" : "items-start"}`}>
-        {message.messageType && !isUser && (
+        {message.messageType && message.messageType !== "simple" && !isUser && (
           <span
             className={`
               inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium
@@ -334,7 +389,7 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
         {message.imageBase64 && message.imageMime && (
           <img
             src={`data:${message.imageMime};base64,${message.imageBase64}`}
-            alt="imagem anexada"
+            alt="attached image"
             className="max-h-48 rounded-xl border border-zinc-700 object-contain mb-1"
           />
         )}
@@ -353,7 +408,10 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
           ) : (
             <>
               {message.toolCalls && message.toolCalls.length > 0 && (
-                <SearchBlock toolCalls={message.toolCalls} />
+                <>
+                  <SearchBlock toolCalls={message.toolCalls} />
+                  <TerminalBlock toolCalls={message.toolCalls} />
+                </>
               )}
               {parts?.map((part, i) =>
                 part.type === "thinking" ? (

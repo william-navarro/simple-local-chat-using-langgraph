@@ -18,6 +18,7 @@ class ChatRequest(BaseModel):
     model: str = "local-model"
     thinking_mode: bool = False
     web_search: bool = False
+    terminal_access: bool = False
 
 
 class TitleRequest(BaseModel):
@@ -27,6 +28,21 @@ class TitleRequest(BaseModel):
 
 class TitleResponse(BaseModel):
     title: str
+
+
+class TerminalExecuteRequest(BaseModel):
+    command: str
+    working_directory: str = "."
+
+
+class TerminalExecuteResponse(BaseModel):
+    status: str
+    command: str
+    exit_code: int | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    truncated: bool = False
+    message: str | None = None
 
 
 class ErrorResponse(BaseModel):

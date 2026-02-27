@@ -1,5 +1,6 @@
 import asyncio
 import json
+import platform
 import re
 from typing import AsyncIterator, TypedDict, Literal
 
@@ -15,7 +16,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from config import settings
-from tools import ALL_TOOLS
+from tools import ALL_TOOLS, web_search, terminal_execute
 
 
 # --- State ---
@@ -30,11 +31,28 @@ class GraphState(TypedDict):
     model: str
     thinking_mode: bool
     web_search: bool
+    terminal_access: bool
     tool_calls_log: list[dict]
     tool_call_iterations: int
+    has_pending_terminal: bool
 
 
 # --- Helpers ---
+
+def get_enabled_tools(state: dict) -> list:
+    """Return the list of tools to bind based on state flags."""
+    tools = []
+    if state.get("web_search"):
+        tools.append(web_search)
+    if state.get("terminal_access"):
+        tools.append(terminal_execute)
+    return tools
+
+
+def has_tools_enabled(state: dict) -> bool:
+    """Check if any tool mode is enabled."""
+    return bool(state.get("web_search") or state.get("terminal_access"))
+
 
 def get_llm(model: str, temperature: float = 0.7, streaming: bool = False) -> ChatOpenAI:
     return ChatOpenAI(
@@ -59,7 +77,12 @@ def estimate_tokens(messages: list[AnyMessage]) -> int:
     return total // 4
 
 
-def build_system_prompt(message_type: str, thinking_mode: bool, web_search: bool = False) -> str:
+def build_system_prompt(
+    message_type: str,
+    thinking_mode: bool,
+    web_search: bool = False,
+    terminal_access: bool = False,
+) -> str:
     base = "You are a helpful and concise AI assistant."
 
     if message_type == "summary_request":
@@ -73,6 +96,37 @@ def build_system_prompt(message_type: str, thinking_mode: bool, web_search: bool
             "requires up-to-date information, recent events, real-time data, current prices, "
             "weather, news, or facts you are not confident about. For general knowledge, "
             "coding help, or creative tasks, answer directly without searching."
+        )
+
+    if terminal_access:
+        os_name = platform.system()
+        if os_name == "Windows":
+            os_hint = (
+                "The user is on Windows and commands run via PowerShell. "
+                "Use PowerShell cmdlets: Get-ChildItem (list files), Get-Content (read file), "
+                "Get-Process, Get-Service, Get-ComputerInfo, Test-Path, Select-Object, "
+                "Sort-Object, Format-Table, etc. Pipelines with | are allowed "
+                "(e.g. Get-ChildItem | Select-Object Name, Length). "
+                "Classic commands like dir, type, tree, git also work."
+            )
+        elif os_name == "Darwin":
+            os_hint = "The user is on macOS. Use Unix commands like ls, cat, grep, find."
+        else:
+            os_hint = f"The user is on {os_name}. Use Unix commands like ls, cat, grep, find."
+        base += (
+            " You have access to a terminal_execute tool that can run read-only "
+            "shell commands on the user's machine. Use it when the user asks to "
+            "inspect files, check directory contents, view git status, read file "
+            "contents, or get system information. Only safe, read-only commands "
+            "are allowed. Commands have a 15-second timeout, so keep them fast. "
+            "NEVER use -Recurse on root directories (C:\\, D:\\, /) as it will "
+            "timeout scanning thousands of files. Always scope commands to specific "
+            "folders. If the user asks about a broad location, list the top-level "
+            "first, then drill down into specific subdirectories as needed. "
+            + os_hint +
+            " IMPORTANT: If a command fails or returns an error, do NOT give up. "
+            "Analyze the error, fix the command, and try again with the corrected version. "
+            "Only explain the error to the user if you have exhausted all alternatives."
         )
 
     # thinking_mode is handled entirely by the model's native behavior
@@ -110,6 +164,7 @@ def build_llm_messages(state: dict) -> list[AnyMessage]:
         state.get("message_type", "simple"),
         state.get("thinking_mode", False),
         state.get("web_search", False),
+        state.get("terminal_access", False),
     )
     user_content = build_user_content(
         state["new_message"],
@@ -174,43 +229,19 @@ async def node_compress_history(state: GraphState) -> GraphState:
     return {**state, "messages": compressed, "history_compressed": True}
 
 
-_FAKE_TOOL_PATTERNS = re.compile(
-    r"\[TOOL_REQUEST\].*?\[/TOOL_REQUEST\]"
-    r"|<tool_call>.*?</tool_call>"
-    r"|<function_call>.*?</function_call>"
-    r"|\{\"name\":\s*\"web_search\".*?\}",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def _clean_fake_tool_text(content: str) -> str:
-    """Strip fake tool-calling patterns emitted by models that don't support tools."""
-    cleaned = _FAKE_TOOL_PATTERNS.sub("", content).strip()
-    return cleaned if cleaned else content
-
-
 async def node_call_model(state: GraphState) -> GraphState:
     """Call the LLM, optionally with tools bound (non-streaming for tool detection)."""
     msgs = build_llm_messages(state)
     llm = get_llm(state["model"])
 
-    if state.get("web_search") and settings.tools_enabled:
+    enabled_tools = get_enabled_tools(state)
+    if enabled_tools and settings.tools_enabled:
         try:
-            llm_with_tools = llm.bind_tools(ALL_TOOLS)
+            llm_with_tools = llm.bind_tools(enabled_tools)
             response = await llm_with_tools.ainvoke(msgs)
         except Exception as e:
             print(f"[CALL_MODEL] Tool binding failed, falling back: {e}")
             response = await llm.ainvoke(msgs)
-
-        # If model didn't produce real tool_calls but emitted tool-like text,
-        # clean the content so the user doesn't see raw tool markup.
-        if (
-            not getattr(response, "tool_calls", None)
-            and isinstance(response.content, str)
-            and _FAKE_TOOL_PATTERNS.search(response.content)
-        ):
-            print("[CALL_MODEL] Detected fake tool text, cleaning response")
-            response = AIMessage(content=_clean_fake_tool_text(response.content))
     else:
         response = await llm.ainvoke(msgs)
 
@@ -222,14 +253,39 @@ async def node_call_model(state: GraphState) -> GraphState:
 
 
 async def node_tool_executor(state: GraphState) -> GraphState:
-    """Execute tool calls from the last AIMessage."""
+    """Execute tool calls from the last AIMessage.
+
+    Terminal commands are NOT executed here — they are recorded as pending
+    so the frontend can request user approval before actual execution.
+    When a terminal command is found, the graph stops the ReAct loop
+    (via has_pending_terminal flag) to avoid duplicate calls.
+    """
     last_msg = state["messages"][-1]
     tool_messages: list[ToolMessage] = []
     log_entries: list[dict] = []
+    found_terminal = False
 
     tools_by_name = {t.name: t for t in ALL_TOOLS}
 
     for tc in last_msg.tool_calls:
+        if tc["name"] == "terminal_execute":
+            # Don't execute — record as pending for frontend approval
+            pending = json.dumps({
+                "status": "pending_approval",
+                "command": tc["args"].get("command", ""),
+                "working_directory": tc["args"].get("working_directory", "."),
+            })
+            tool_messages.append(
+                ToolMessage(content=pending, tool_call_id=tc["id"])
+            )
+            log_entries.append({
+                "name": tc["name"],
+                "args": tc["args"],
+                "result": pending,
+            })
+            found_terminal = True
+            continue
+
         tool_fn = tools_by_name.get(tc["name"])
         if not tool_fn:
             result = json.dumps({"status": "error", "message": f"Unknown tool: {tc['name']}"})
@@ -249,6 +305,7 @@ async def node_tool_executor(state: GraphState) -> GraphState:
         **state,
         "messages": state["messages"] + tool_messages,
         "tool_calls_log": state.get("tool_calls_log", []) + log_entries,
+        "has_pending_terminal": found_terminal,
     }
 
 
@@ -295,11 +352,8 @@ async def generate_title_from_message(model: str, user_message: str) -> str:
             )),
         ])
         raw = response.content or ""
-        print(f"[TITLE] Raw response: {raw!r}")
         title = _clean_title(raw)
-        print(f"[TITLE] After clean: {title!r}")
-    except Exception as e:
-        print(f"[TITLE] Error: {e}")
+    except Exception:
         title = ""
 
     if not title:
@@ -307,7 +361,6 @@ async def generate_title_from_message(model: str, user_message: str) -> str:
         title = " ".join(words)
         if len(title) > 60:
             title = title[:57] + "..."
-        print(f"[TITLE] Using fallback: {title!r}")
 
     return title
 
@@ -317,25 +370,32 @@ async def generate_title_from_message(model: str, user_message: str) -> str:
 def route_after_check(state: GraphState) -> str:
     if state["history_compressed"]:
         return "compress"
-    # If web_search is enabled, route to call_model node (non-streaming, with tools)
+    # If any tools are enabled, route to call_model node (non-streaming, with tools)
     # Otherwise, route to END so streaming happens outside the graph
-    if state.get("web_search") and settings.tools_enabled:
+    if has_tools_enabled(state) and settings.tools_enabled:
         return "call_model"
     return END
 
 
 def _route_after_compress(state: GraphState) -> str:
-    """After compressing history, go to call_model if web_search, otherwise END."""
-    if state.get("web_search") and settings.tools_enabled:
+    """After compressing history, go to call_model if tools enabled, otherwise END."""
+    if has_tools_enabled(state) and settings.tools_enabled:
         return "call_model"
     return END
+
+
+def route_after_tool(state: GraphState) -> str:
+    """Route after tool execution: if terminal is pending approval, stop the loop."""
+    if state.get("has_pending_terminal"):
+        return END
+    return "call_model"
 
 
 def route_after_model(state: GraphState) -> str:
     """Route after LLM call: if tool_calls present, go to tool_node; otherwise END."""
     last_msg = state["messages"][-1]
     if (
-        state.get("web_search")
+        has_tools_enabled(state)
         and hasattr(last_msg, "tool_calls")
         and last_msg.tool_calls
         and state.get("tool_call_iterations", 0) < settings.tool_call_max_iterations
@@ -385,7 +445,11 @@ def build_graph():
         route_after_model,
         {"tool_node": "tool_node", END: END},
     )
-    graph.add_edge("tool_node", "call_model")
+    graph.add_conditional_edges(
+        "tool_node",
+        route_after_tool,
+        {"call_model": "call_model", END: END},
+    )
 
     return graph.compile(checkpointer=memory)
 
@@ -404,6 +468,7 @@ async def stream_graph_response(
     model: str,
     thinking_mode: bool,
     web_search: bool = False,
+    terminal_access: bool = False,
 ) -> AsyncIterator[str]:
 
     def deserialize(m: dict) -> AnyMessage:
@@ -425,11 +490,17 @@ async def stream_graph_response(
         "model": model,
         "thinking_mode": thinking_mode,
         "web_search": web_search,
+        "terminal_access": terminal_access,
         "tool_calls_log": [],
         "tool_call_iterations": 0,
+        "has_pending_terminal": False,
     }
 
     config = {"configurable": {"thread_id": thread_id}}
+
+    # Emit compressing event if history will need compression
+    if estimate_tokens(history) > settings.max_history_tokens:
+        yield f"data: {json.dumps({'type': 'compressing'})}\n\n"
 
     # Run the graph
     final_state = await compiled_graph.ainvoke(initial_state, config=config)
@@ -437,36 +508,53 @@ async def stream_graph_response(
     message_type = final_state.get("message_type", "simple")
     yield f"data: {json.dumps({'type': 'message_type', 'content': message_type})}\n\n"
 
-    if web_search and settings.tools_enabled:
-        # --- Web search path ---
+    tools_active = (web_search or terminal_access) and settings.tools_enabled
+    if tools_active:
+        # --- Tools path ---
         # The graph executed the full ReAct loop (call_model ↔ tool_node).
         # Emit tool events to the frontend, then stream the final answer.
 
         tool_log = final_state.get("tool_calls_log", [])
+        has_pending_terminal = final_state.get("has_pending_terminal", False)
+
         for entry in tool_log:
+            if entry["name"] == "terminal_execute":
+                result_data = json.loads(entry["result"]) if isinstance(entry["result"], str) else entry["result"]
+                if result_data.get("status") == "pending_approval":
+                    # Emit pending event — frontend must approve before execution
+                    yield f"data: {json.dumps({'type': 'terminal_pending', 'content': json.dumps({'command': result_data['command'], 'working_directory': result_data.get('working_directory', '.')})})}\n\n"
+                    continue
             yield f"data: {json.dumps({'type': 'tool_start', 'content': json.dumps({'name': entry['name'], 'args': entry['args']})})}\n\n"
             yield f"data: {json.dumps({'type': 'tool_result', 'content': entry['result']})}\n\n"
 
-        if tool_log:
+        if has_pending_terminal:
+            # Terminal commands need user approval — don't stream final answer yet.
+            # The frontend will call /chat/terminal/execute, get the result,
+            # then make a follow-up chat request with the tool context injected.
+            pass
+        elif tool_log:
             # Tool calls were made — stream a fresh response.
             # We flatten the conversation to avoid sending AIMessage(tool_calls)
             # and ToolMessage to the LLM, which causes jinja template errors
             # in models that don't have tool-role templates.
-            search_context = "\n\n".join(
-                f"[Web search: {entry['name']}({entry['args']})]\n{entry['result']}"
+            tool_context = "\n\n".join(
+                f"[Tool call: {entry['name']}({entry['args']})]\n{entry['result']}"
                 for entry in tool_log
             )
             stream_msgs: list[AnyMessage] = [
-                SystemMessage(content=build_system_prompt(message_type, thinking_mode, web_search=True))
+                SystemMessage(content=build_system_prompt(
+                    message_type, thinking_mode,
+                    web_search=web_search, terminal_access=terminal_access,
+                ))
             ]
             # Keep only HumanMessage/AIMessage from history (skip tool messages)
             for m in final_state["messages"]:
                 if isinstance(m, (HumanMessage, AIMessage)) and not getattr(m, "tool_calls", None):
                     stream_msgs.append(m)
-            # Inject search results as context, then the user's question
+            # Inject tool results as context, then the user's question
             stream_msgs.append(SystemMessage(content=(
-                "The following web search results were retrieved. "
-                "Use them to answer the user's question:\n\n" + search_context
+                "The following tool results were retrieved. "
+                "Use them to answer the user's question:\n\n" + tool_context
             )))
             stream_msgs.append(HumanMessage(content=build_user_content(
                 new_message, image_base64, image_media_type,
@@ -479,15 +567,68 @@ async def stream_graph_response(
                     yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
         else:
             # No tool calls were made (model answered directly even with tools available).
-            # Emit the non-streamed response in chunks.
-            last_msg = final_state["messages"][-1]
-            content = last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)
+            # Stream a fresh response so the user sees real token-by-token output.
+            if thinking_mode:
+                yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
 
-            chunk_size = 12
-            for i in range(0, len(content), chunk_size):
-                chunk = content[i : i + chunk_size]
-                yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-                await asyncio.sleep(0.01)
+            stream_msgs: list[AnyMessage] = [
+                SystemMessage(content=build_system_prompt(
+                    message_type, thinking_mode,
+                    web_search=web_search, terminal_access=terminal_access,
+                ))
+            ]
+            stream_msgs.extend(history)
+            stream_msgs.append(HumanMessage(content=build_user_content(
+                new_message, image_base64, image_media_type,
+            )))
+
+            llm = get_llm(model, streaming=True)
+
+            emit_buffer = ""
+            inside_think = False
+
+            async for chunk in llm.astream(stream_msgs):
+                token = chunk.content or ""
+                if not token:
+                    continue
+
+                if thinking_mode:
+                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                    continue
+
+                # Filter <think>...</think> blocks when thinking_mode is off
+                emit_buffer += token
+
+                while True:
+                    if inside_think:
+                        close = emit_buffer.find("</think")
+                        if close == -1:
+                            emit_buffer = ""
+                            break
+                        tag_end = emit_buffer.find(">", close)
+                        if tag_end == -1:
+                            break
+                        emit_buffer = emit_buffer[tag_end + 1:]
+                        inside_think = False
+                    else:
+                        open_pos = emit_buffer.find("<think")
+                        if open_pos == -1:
+                            if emit_buffer:
+                                yield f"data: {json.dumps({'type': 'token', 'content': emit_buffer})}\n\n"
+                                emit_buffer = ""
+                            break
+                        before = emit_buffer[:open_pos]
+                        if before:
+                            yield f"data: {json.dumps({'type': 'token', 'content': before})}\n\n"
+                        tag_end = emit_buffer.find(">", open_pos)
+                        if tag_end == -1:
+                            emit_buffer = emit_buffer[open_pos:]
+                            break
+                        emit_buffer = emit_buffer[tag_end + 1:]
+                        inside_think = True
+
+            if not thinking_mode and emit_buffer and not inside_think:
+                yield f"data: {json.dumps({'type': 'token', 'content': emit_buffer})}\n\n"
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 

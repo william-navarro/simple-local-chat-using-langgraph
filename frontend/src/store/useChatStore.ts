@@ -3,14 +3,24 @@ import { persist } from "zustand/middleware"
 import { v4 as uuidv4 } from "uuid"
 import type { Conversation, Message, MessageType, ToolCallInfo } from "../types"
 
+export interface PendingTerminalCommand {
+  command: string
+  workingDirectory: string
+}
+
 interface ChatStore {
   conversations: Conversation[]
   activeConversationId: string | null
   isStreaming: boolean
   isThinking: boolean
   isSearching: boolean
+  isExecuting: boolean
+  isCompressing: boolean
   thinkingMode: boolean
   webSearchMode: boolean
+  terminalMode: boolean
+  autoApproveTerminal: boolean
+  pendingTerminalCommand: PendingTerminalCommand | null
   selectedModel: string
 
   createConversation: () => string
@@ -24,8 +34,13 @@ interface ChatStore {
   setStreaming: (value: boolean) => void
   setThinking: (value: boolean) => void
   setSearching: (value: boolean) => void
+  setExecuting: (value: boolean) => void
+  setCompressing: (value: boolean) => void
+  setPendingTerminalCommand: (cmd: PendingTerminalCommand | null) => void
+  setAutoApproveTerminal: (value: boolean) => void
   toggleThinkingMode: () => void
   toggleWebSearchMode: () => void
+  toggleTerminalMode: () => void
   setSelectedModel: (model: string) => void
   getActiveConversation: () => Conversation | null
 }
@@ -38,8 +53,13 @@ export const useChatStore = create<ChatStore>()(
       isStreaming: false,
       isThinking: false,
       isSearching: false,
+      isExecuting: false,
+      isCompressing: false,
       thinkingMode: false,
       webSearchMode: false,
+      terminalMode: false,
+      autoApproveTerminal: false,
+      pendingTerminalCommand: null,
       selectedModel: "",
 
       createConversation: () => {
@@ -47,7 +67,7 @@ export const useChatStore = create<ChatStore>()(
         const now = Date.now()
         const conversation: Conversation = {
           id,
-          title: "Nova conversa",
+          title: "New conversation",
           messages: [],
           createdAt: now,
           updatedAt: now,
@@ -151,8 +171,13 @@ export const useChatStore = create<ChatStore>()(
       setStreaming: (value) => set({ isStreaming: value }),
       setThinking: (value) => set({ isThinking: value }),
       setSearching: (value) => set({ isSearching: value }),
+      setExecuting: (value) => set({ isExecuting: value }),
+      setCompressing: (value) => set({ isCompressing: value }),
+      setPendingTerminalCommand: (cmd) => set({ pendingTerminalCommand: cmd }),
+      setAutoApproveTerminal: (value) => set({ autoApproveTerminal: value }),
       toggleThinkingMode: () => set((state) => ({ thinkingMode: !state.thinkingMode })),
       toggleWebSearchMode: () => set((state) => ({ webSearchMode: !state.webSearchMode })),
+      toggleTerminalMode: () => set((state) => ({ terminalMode: !state.terminalMode })),
       setSelectedModel: (model) => set({ selectedModel: model }),
 
       getActiveConversation: () => {
@@ -160,6 +185,16 @@ export const useChatStore = create<ChatStore>()(
         return conversations.find((c) => c.id === activeConversationId) ?? null
       },
     }),
-    { name: "langgraph-chat-storage" }
+    {
+      name: "langgraph-chat-storage",
+      partialize: (state) => ({
+        conversations: state.conversations,
+        activeConversationId: state.activeConversationId,
+        thinkingMode: state.thinkingMode,
+        webSearchMode: state.webSearchMode,
+        terminalMode: state.terminalMode,
+        selectedModel: state.selectedModel,
+      }),
+    }
   )
 )

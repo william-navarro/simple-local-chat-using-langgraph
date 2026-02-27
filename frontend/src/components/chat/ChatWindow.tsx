@@ -1,10 +1,10 @@
 import { useChatStore } from "../../store/useChatStore"
 import { MessageList } from "./MessageList"
 import { InputBar } from "./InputBar"
-import { Bot, Brain, Globe } from "lucide-react"
+import { Bot, Brain, Globe, Terminal, Archive } from "lucide-react"
 
 export function ChatWindow() {
-  const { activeConversationId, getActiveConversation, createConversation, isThinking, isSearching } = useChatStore()
+  const { activeConversationId, getActiveConversation, createConversation, isThinking, isSearching, isExecuting, isCompressing, pendingTerminalCommand } = useChatStore()
   const conversation = getActiveConversation()
 
   if (!activeConversationId || !conversation) {
@@ -15,16 +15,16 @@ export function ChatWindow() {
             <Bot size={36} className="text-violet-400" />
           </div>
           <h2 className="text-white font-semibold text-lg mb-2">
-            Bem-vindo ao LangGraph Chat
+            Welcome to LangGraph Chat
           </h2>
           <p className="text-zinc-500 text-sm mb-6 max-w-xs">
-            Selecione uma conversa na barra lateral ou crie uma nova para comecar.
+            Select a conversation from the sidebar or create a new one to get started.
           </p>
           <button
             onClick={createConversation}
             className="px-5 py-2.5 rounded-lg text-sm font-medium bg-gradient-to-r from-violet-600 to-indigo-600 text-white hover:from-violet-500 hover:to-indigo-500 transition-all duration-150"
           >
-            Nova conversa
+            New conversation
           </button>
         </div>
       </div>
@@ -38,20 +38,38 @@ export function ChatWindow() {
           {conversation.title}
         </h2>
         <div className="ml-auto flex items-center gap-3">
-          {isSearching && (
-            <span className="flex items-center gap-1.5 text-xs text-blue-400 animate-pulse">
-              <Globe size={12} />
-              Pesquisando na web...
+          {isCompressing && (
+            <span className="flex items-center gap-1.5 text-xs text-cyan-400 animate-pulse">
+              <Archive size={12} />
+              Compressing...
             </span>
           )}
-          {isThinking && !isSearching && (
+          {pendingTerminalCommand && (
+            <span className="flex items-center gap-1.5 text-xs text-yellow-400 animate-pulse">
+              <Terminal size={12} />
+              Waiting for approval...
+            </span>
+          )}
+          {isExecuting && !pendingTerminalCommand && (
+            <span className="flex items-center gap-1.5 text-xs text-green-400 animate-pulse">
+              <Terminal size={12} />
+              Running command...
+            </span>
+          )}
+          {isSearching && !isExecuting && (
+            <span className="flex items-center gap-1.5 text-xs text-blue-400 animate-pulse">
+              <Globe size={12} />
+              Searching the web...
+            </span>
+          )}
+          {isThinking && !isSearching && !isExecuting && (
             <span className="flex items-center gap-1.5 text-xs text-violet-400 animate-pulse">
               <Brain size={12} />
-              Pensando...
+              Thinking...
             </span>
           )}
           <span className="text-xs text-zinc-600">
-            {conversation.messages.length} mensagem{conversation.messages.length !== 1 ? "s" : ""}
+            {conversation.messages.length} message{conversation.messages.length !== 1 ? "s" : ""}
           </span>
         </div>
       </div>

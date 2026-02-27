@@ -5,8 +5,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from config import settings
-from schemas import ChatRequest, TitleRequest, TitleResponse, ErrorResponse
+from schemas import (
+    ChatRequest, TitleRequest, TitleResponse, ErrorResponse,
+    TerminalExecuteRequest, TerminalExecuteResponse,
+)
 from graph import stream_graph_response, generate_title_from_message
+from tools import execute_terminal_command
 
 app = FastAPI(
     title="LangGraph Chat API",
@@ -85,6 +89,7 @@ async def chat_stream(request: ChatRequest):
                 model=request.model,
                 thinking_mode=request.thinking_mode,
                 web_search=request.web_search,
+                terminal_access=request.terminal_access,
             ):
                 yield chunk
         except Exception as e:
@@ -98,3 +103,12 @@ async def chat_stream(request: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post(
+    "/chat/terminal/execute",
+    response_model=TerminalExecuteResponse,
+)
+async def terminal_execute_endpoint(request: TerminalExecuteRequest):
+    result = execute_terminal_command(request.command, request.working_directory)
+    return TerminalExecuteResponse(**result)

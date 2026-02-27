@@ -21,9 +21,9 @@ export function Sidebar() {
   }, [])
 
   const statusLabel = online === null
-    ? "verificando..."
+    ? "checking..."
     : online
-    ? "LM Studio conectado"
+    ? "LM Studio connected"
     : "LM Studio offline"
 
   const statusColor = online === null
@@ -34,7 +34,7 @@ export function Sidebar() {
 
   const displayModel = selectedModel
     ? selectedModel.length > 22 ? selectedModel.slice(0, 22) + "..." : selectedModel
-    : "nenhum modelo"
+    : "no model"
 
   return (
     <aside className="flex flex-col w-64 h-full bg-zinc-900 border-r border-zinc-800">
@@ -52,7 +52,7 @@ export function Sidebar() {
       </div>
 
       <div className="px-3 pt-3 pb-2 border-b border-zinc-800">
-        <p className="text-xs text-zinc-500 mb-1.5 px-1">Modelo ativo</p>
+        <p className="text-xs text-zinc-500 mb-1.5 px-1">Active model</p>
         <div className="relative" ref={dropdownRef}>
           <button
             onClick={() => setDropdownOpen((v) => !v)}
@@ -85,14 +85,14 @@ export function Sidebar() {
           className="flex items-center gap-2 w-full px-3 py-2 rounded-lg bg-gradient-to-r from-violet-600 to-indigo-600 text-white text-sm font-medium hover:from-violet-500 hover:to-indigo-500 transition-all duration-150"
         >
           <Plus size={16} />
-          Nova conversa
+          New conversation
         </button>
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-0.5">
         {conversations.length === 0 ? (
           <p className="text-xs text-zinc-600 text-center mt-8 px-4">
-            Nenhuma conversa ainda. Clique em Nova conversa para comecar.
+            No conversations yet. Click New conversation to get started.
           </p>
         ) : (
           conversations.map((conv) => (
