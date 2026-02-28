@@ -1,11 +1,12 @@
 import { create } from "zustand"
 import { persist } from "zustand/middleware"
 import { v4 as uuidv4 } from "uuid"
-import type { Conversation, Message, MessageType, ToolCallInfo } from "../types"
+import type { Conversation, Message, MessageType, ToolCallInfo, ImageResult, LLMProvider, GlobalSettings, ConversationSettings } from "../types"
 
 export interface PendingTerminalCommand {
   command: string
   workingDirectory: string
+  shell: string
 }
 
 interface ChatStore {
@@ -21,8 +22,17 @@ interface ChatStore {
   terminalMode: boolean
   autoApproveTerminal: boolean
   pendingTerminalCommand: PendingTerminalCommand | null
+  selectedProvider: LLMProvider
   selectedModel: string
+  globalSettings: GlobalSettings
+  settingsModalOpen: boolean
 
+  setGlobalSettings: (settings: GlobalSettings) => void
+  setSettingsModalOpen: (open: boolean) => void
+  setConversationSettings: (conversationId: string, settings: ConversationSettings) => void
+  clearConversationSettings: (conversationId: string) => void
+  getEffectiveSettings: () => GlobalSettings
+  setSelectedProvider: (provider: LLMProvider) => void
   createConversation: () => string
   deleteConversation: (id: string) => void
   setActiveConversation: (id: string) => void
@@ -31,6 +41,7 @@ interface ChatStore {
   setTitle: (conversationId: string, title: string) => void
   setMessageType: (conversationId: string, messageId: string, type: MessageType) => void
   setToolCalls: (conversationId: string, messageId: string, toolCalls: ToolCallInfo[]) => void
+  addImage: (conversationId: string, messageId: string, image: ImageResult) => void
   setStreaming: (value: boolean) => void
   setThinking: (value: boolean) => void
   setSearching: (value: boolean) => void
@@ -60,7 +71,46 @@ export const useChatStore = create<ChatStore>()(
       terminalMode: false,
       autoApproveTerminal: false,
       pendingTerminalCommand: null,
+      selectedProvider: "lm_studio" as LLMProvider,
       selectedModel: "",
+      globalSettings: {
+        temperature: 0.3,
+        top_p: 1.0,
+        max_response_tokens: 4096,
+        max_history_tokens: 2000,
+        system_prompt: "",
+        tool_call_max_iterations: 8,
+        tool_call_timeout: 120,
+      } as GlobalSettings,
+      settingsModalOpen: false,
+
+      setGlobalSettings: (settings) => set({ globalSettings: settings }),
+      setSettingsModalOpen: (open) => set({ settingsModalOpen: open }),
+      setConversationSettings: (conversationId, settings) => {
+        set((state) => ({
+          conversations: state.conversations.map((c) =>
+            c.id === conversationId ? { ...c, settings } : c
+          ),
+        }))
+      },
+      clearConversationSettings: (conversationId) => {
+        set((state) => ({
+          conversations: state.conversations.map((c) =>
+            c.id === conversationId ? { ...c, settings: undefined } : c
+          ),
+        }))
+      },
+      getEffectiveSettings: () => {
+        const { globalSettings, conversations, activeConversationId } = get()
+        const conv = conversations.find((c) => c.id === activeConversationId)
+        if (!conv?.settings) return globalSettings
+        return {
+          ...globalSettings,
+          ...Object.fromEntries(
+            Object.entries(conv.settings).filter(([, v]) => v !== undefined)
+          ),
+        } as GlobalSettings
+      },
 
       createConversation: () => {
         const id = uuidv4()
@@ -168,6 +218,25 @@ export const useChatStore = create<ChatStore>()(
         }))
       },
 
+      addImage: (conversationId, messageId, image) => {
+        set((state) => ({
+          conversations: state.conversations.map((c) =>
+            c.id === conversationId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) => {
+                    if (m.id !== messageId) return m
+                    const existing = m.images ?? []
+                    // Deduplicate by file_path
+                    if (existing.some((img) => img.file_path === image.file_path)) return m
+                    return { ...m, images: [...existing, image] }
+                  }),
+                }
+              : c
+          ),
+        }))
+      },
+
       setStreaming: (value) => set({ isStreaming: value }),
       setThinking: (value) => set({ isThinking: value }),
       setSearching: (value) => set({ isSearching: value }),
@@ -178,6 +247,7 @@ export const useChatStore = create<ChatStore>()(
       toggleThinkingMode: () => set((state) => ({ thinkingMode: !state.thinkingMode })),
       toggleWebSearchMode: () => set((state) => ({ webSearchMode: !state.webSearchMode })),
       toggleTerminalMode: () => set((state) => ({ terminalMode: !state.terminalMode })),
+      setSelectedProvider: (provider) => set({ selectedProvider: provider, selectedModel: "" }),
       setSelectedModel: (model) => set({ selectedModel: model }),
 
       getActiveConversation: () => {
@@ -193,7 +263,9 @@ export const useChatStore = create<ChatStore>()(
         thinkingMode: state.thinkingMode,
         webSearchMode: state.webSearchMode,
         terminalMode: state.terminalMode,
+        selectedProvider: state.selectedProvider,
         selectedModel: state.selectedModel,
+        globalSettings: state.globalSettings,
       }),
     }
   )

@@ -4,6 +4,9 @@ node_modules/
 # Environment variables
 .env
 
+# Runtime settings (user-specific)
+backend/settings.json
+
 # Python
 __pycache__/
 *.pyc

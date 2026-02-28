@@ -3,6 +3,7 @@ import { useChatStore } from "../../store/useChatStore"
 
 interface TerminalConfirmDialogProps {
   command: string
+  shell?: string
   onApprove: () => void
   onApproveAlways: () => void
   onDeny: () => void
@@ -10,6 +11,7 @@ interface TerminalConfirmDialogProps {
 
 export function TerminalConfirmDialog({
   command,
+  shell = "cmd",
   onApprove,
   onApproveAlways,
   onDeny,
@@ -22,6 +24,9 @@ export function TerminalConfirmDialog({
         <Terminal size={14} className="text-green-400" />
         <span className="text-xs font-medium text-green-300">
           The AI wants to run a command
+        </span>
+        <span className="text-xs text-green-500/70 ml-auto font-mono">
+          {shell === "powershell" ? "PowerShell" : "CMD"}
         </span>
       </div>
 

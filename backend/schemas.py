@@ -15,14 +15,23 @@ class ChatRequest(BaseModel):
     new_message: str
     image_base64: str | None = None
     image_media_type: str | None = None
+    provider: str = "lm_studio"
     model: str = "local-model"
     thinking_mode: bool = False
     web_search: bool = False
     terminal_access: bool = False
+    # Per-request overrides (None = use server defaults)
+    temperature: float | None = None
+    top_p: float | None = None
+    max_response_tokens: int | None = None
+    max_history_tokens: int | None = None
+    system_prompt: str | None = None
+    tool_call_max_iterations: int | None = None
 
 
 class TitleRequest(BaseModel):
     message: str
+    provider: str = "lm_studio"
     model: str = "local-model"
 
 
@@ -33,6 +42,7 @@ class TitleResponse(BaseModel):
 class TerminalExecuteRequest(BaseModel):
     command: str
     working_directory: str = "."
+    shell: str = "cmd"
 
 
 class TerminalExecuteResponse(BaseModel):
@@ -47,3 +57,25 @@ class TerminalExecuteResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class GlobalSettings(BaseModel):
+    temperature: float = 0.3
+    top_p: float = 1.0
+    max_response_tokens: int = 4096
+    max_history_tokens: int = 2000
+    system_prompt: str = ""
+    tool_call_max_iterations: int = 8
+    tool_call_timeout: int = 120
+
+
+class ApiKeysUpdate(BaseModel):
+    openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    google_api_key: str | None = None
+
+
+class ApiKeysResponse(BaseModel):
+    openai_api_key: str
+    anthropic_api_key: str
+    google_api_key: str

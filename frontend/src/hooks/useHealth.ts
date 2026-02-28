@@ -1,36 +1,46 @@
 import { useEffect, useState } from "react"
-import { fetchLMStudioStatus, fetchLMStudioModels } from "../lib/api"
+import { fetchProviders, fetchProviderModels } from "../lib/api"
 import { useChatStore } from "../store/useChatStore"
+import type { ProviderInfo } from "../types"
 
 export function useHealth() {
-  const [online, setOnline] = useState<boolean | null>(null)
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [models, setModels] = useState<string[]>([])
-  const { selectedModel, setSelectedModel } = useChatStore()
+  const { selectedProvider, selectedModel, setSelectedModel } = useChatStore()
 
+  // Poll all providers for availability
   useEffect(() => {
     let cancelled = false
 
     const check = async () => {
-      const isOnline = await fetchLMStudioStatus()
-      if (cancelled) return
-      setOnline(isOnline)
-
-      if (isOnline) {
-        const available = await fetchLMStudioModels()
-        if (cancelled) return
-        setModels(available)
-        if (available.length > 0 && !selectedModel) {
-          setSelectedModel(available[0])
-        }
-      } else {
-        setModels([])
-      }
+      const list = await fetchProviders()
+      if (!cancelled) setProviders(list)
     }
 
     check()
     const interval = setInterval(check, 10000)
     return () => { cancelled = true; clearInterval(interval) }
-  }, [selectedModel, setSelectedModel])
+  }, [])
 
-  return { online, models }
+  // Fetch models when selectedProvider changes
+  useEffect(() => {
+    let cancelled = false
+
+    const fetchModels = async () => {
+      const available = await fetchProviderModels(selectedProvider)
+      if (cancelled) return
+      setModels(available)
+      if (available.length > 0 && !selectedModel) {
+        setSelectedModel(available[0])
+      }
+    }
+
+    fetchModels()
+    const interval = setInterval(fetchModels, 10000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [selectedProvider, selectedModel, setSelectedModel])
+
+  const online = providers.find((p) => p.id === selectedProvider)?.available ?? null
+
+  return { online, models, providers }
 }

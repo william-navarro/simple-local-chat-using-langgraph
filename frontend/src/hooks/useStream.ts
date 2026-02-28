@@ -1,9 +1,15 @@
 import { useCallback, useRef } from "react"
 import { useChatStore } from "../store/useChatStore"
 import { streamChat, generateTitle, executeTerminalCommand } from "../lib/api"
-import type { MessageRole, ToolCallInfo, SearchResult, TerminalResult } from "../types"
+import type { MessageRole, ToolCallInfo, SearchResult, TerminalResult, ImageResult } from "../types"
 
 export type TerminalApprovalResult = "approve" | "approve_always" | "deny"
+
+const MAX_TOOL_OUTPUT = 2000
+function truncateToolOutput(text: string): string {
+  if (text.length <= MAX_TOOL_OUTPUT) return text
+  return text.slice(0, MAX_TOOL_OUTPUT) + `\n... (truncated, ${text.length} chars)`
+}
 
 export function useStream() {
   const {
@@ -12,6 +18,7 @@ export function useStream() {
     setTitle,
     setMessageType,
     setToolCalls,
+    addImage,
     setStreaming,
     setThinking,
     setSearching,
@@ -20,6 +27,7 @@ export function useStream() {
     setPendingTerminalCommand,
     setAutoApproveTerminal,
     getActiveConversation,
+    selectedProvider,
     selectedModel,
     thinkingMode,
     webSearchMode,
@@ -40,10 +48,10 @@ export function useStream() {
     setPendingTerminalCommand(null)
   }, [setPendingTerminalCommand])
 
-  const waitForApproval = useCallback((command: string, workingDirectory: string): Promise<TerminalApprovalResult> => {
+  const waitForApproval = useCallback((command: string, workingDirectory: string, shell = "cmd"): Promise<TerminalApprovalResult> => {
     return new Promise((resolve) => {
       approvalResolveRef.current = resolve
-      setPendingTerminalCommand({ command, workingDirectory })
+      setPendingTerminalCommand({ command, workingDirectory, shell })
     })
   }, [setPendingTerminalCommand])
 
@@ -93,22 +101,16 @@ export function useStream() {
       setStreaming(true)
       setThinking(true)
 
-      // Generate title FIRST for new conversations — separate endpoint,
-      // guarantees it appears before any streaming tokens
+      // Generate title in background for new conversations (non-blocking)
       if (isFirstMessage) {
-        try {
-          const title = await generateTitle(content, model)
-          if (title) setTitle(conversationId, title)
-        } catch {
-          // title generation is non-critical
-        }
+        generateTitle(content, selectedProvider || "lm_studio", model)
+          .then((title) => { if (title) setTitle(conversationId, title) })
+          .catch(() => { /* title generation is non-critical */ })
       }
 
       const historyMessages = conversation.messages.map((m) => ({
         role: m.role,
         content: m.content,
-        image_base64: m.imageBase64,
-        image_media_type: m.imageMediaType,
       }))
 
       // Collect tool calls to set on the message after streaming
@@ -117,16 +119,25 @@ export function useStream() {
       let terminalToolContext = ""
 
       try {
+        const provider = selectedProvider || "lm_studio"
+        const effectiveSettings = useChatStore.getState().getEffectiveSettings()
         const generator = streamChat({
           thread_id: conversationId,
           messages: historyMessages,
           new_message: content,
           image_base64: imageBase64,
           image_media_type: imageMediaType,
+          provider,
           model,
           thinking_mode: thinkingMode,
           web_search: webSearchMode,
           terminal_access: terminalMode,
+          temperature: effectiveSettings.temperature,
+          top_p: effectiveSettings.top_p,
+          max_response_tokens: effectiveSettings.max_response_tokens,
+          max_history_tokens: effectiveSettings.max_history_tokens,
+          system_prompt: effectiveSettings.system_prompt || undefined,
+          tool_call_max_iterations: effectiveSettings.tool_call_max_iterations,
         }, abortController.signal)
 
         for await (const event of generator) {
@@ -145,6 +156,7 @@ export function useStream() {
               const pending = JSON.parse(event.content ?? "{}")
               const command = pending.command ?? ""
               const workingDirectory = pending.working_directory ?? "."
+              const shell = pending.shell ?? "cmd"
 
               // Check auto-approve
               const autoApprove = useChatStore.getState().autoApproveTerminal
@@ -154,7 +166,7 @@ export function useStream() {
                 decision = "approve"
               } else {
                 // Show dialog and wait for user decision
-                decision = await waitForApproval(command, workingDirectory)
+                decision = await waitForApproval(command, workingDirectory, shell)
               }
 
               if (abortController.signal.aborted) break
@@ -166,7 +178,7 @@ export function useStream() {
               if (decision === "approve" || decision === "approve_always") {
                 // Execute the command
                 setExecuting(true)
-                const result = await executeTerminalCommand(command, workingDirectory)
+                const result = await executeTerminalCommand(command, workingDirectory, shell)
                 setExecuting(false)
 
                 if (abortController.signal.aborted) break
@@ -175,6 +187,7 @@ export function useStream() {
                   name: "terminal_execute",
                   query: "",
                   command,
+                  shell,
                 }
 
                 if (result.status === "success") {
@@ -185,10 +198,11 @@ export function useStream() {
                     stderr: result.stderr ?? "",
                     truncated: result.truncated ?? false,
                   }
-                  terminalToolContext += `\n\n[Tool call: terminal_execute({"command": "${command}"})]\n${JSON.stringify(result)}`
+                  const truncated = truncateToolOutput(JSON.stringify(result))
+                  terminalToolContext += `\n\n[terminal_execute("${command}")]\n${truncated}`
                 } else {
                   tcInfo.error = result.message ?? "Execution failed"
-                  terminalToolContext += `\n\n[Tool call: terminal_execute({"command": "${command}"})]\n${JSON.stringify(result)}`
+                  terminalToolContext += `\n\n[terminal_execute("${command}")]\nError: ${result.message ?? "failed"}`
                 }
 
                 collectedToolCalls.push(tcInfo)
@@ -199,11 +213,12 @@ export function useStream() {
                   name: "terminal_execute",
                   query: "",
                   command,
+                  shell,
                   error: "Command rejected by user",
                 }
                 collectedToolCalls.push(tcInfo)
                 setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
-                terminalToolContext += `\n\n[Tool call: terminal_execute({"command": "${command}"})]\n{"status": "denied", "message": "User denied execution of this command."}`
+                terminalToolContext += `\n\n[terminal_execute("${command}")]\nDenied by user.`
               }
             } catch {
               setExecuting(false)
@@ -257,6 +272,11 @@ export function useStream() {
             if (collectedToolCalls.length > 0) {
               setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
             }
+          } else if (event.type === "image_result") {
+            try {
+              const imgData = JSON.parse(event.content ?? "{}") as ImageResult
+              addImage(conversationId, assistantMessageId, imgData)
+            } catch { /* ignore */ }
           } else if (event.type === "tool_error") {
             setSearching(false)
             setExecuting(false)
@@ -297,11 +317,12 @@ export function useStream() {
               ...historyMessages,
               { role: "user" as MessageRole, content },
             ],
-            new_message: `[SYSTEM: The following terminal tool results are available. Use them to answer the user's question.${terminalToolContext}]\n\n${content}`,
+            new_message: `[Tool results:${terminalToolContext}]\n\n${content}`,
+            provider,
             model,
             thinking_mode: thinkingMode,
-            web_search: false,
-            terminal_access: false,
+            web_search: webSearchMode,
+            terminal_access: terminalMode,
           }, followUpAbort.signal)
 
           for await (const event of followUpGenerator) {
@@ -309,10 +330,67 @@ export function useStream() {
 
             if (event.type === "token") {
               setThinking(false)
+              setSearching(false)
+              setExecuting(false)
               appendToken(conversationId, assistantMessageId, event.content ?? "")
             } else if (event.type === "thinking_start") {
               setThinking(true)
+            } else if (event.type === "tool_start") {
+              setThinking(false)
+              try {
+                const info = JSON.parse(event.content ?? "{}")
+                if (info.name === "terminal_execute") {
+                  setExecuting(true)
+                } else {
+                  setSearching(true)
+                }
+                collectedToolCalls.push({
+                  name: info.name ?? "unknown",
+                  query: info.args?.query ?? "",
+                  command: info.args?.command ?? "",
+                })
+              } catch { /* ignore */ }
+            } else if (event.type === "tool_result") {
+              try {
+                const result = JSON.parse(event.content ?? "{}")
+                const lastTc = collectedToolCalls[collectedToolCalls.length - 1]
+                if (lastTc?.name === "terminal_execute") {
+                  if (result.status === "success") {
+                    lastTc.terminalResult = {
+                      command: result.command,
+                      exit_code: result.exit_code,
+                      stdout: result.stdout,
+                      stderr: result.stderr,
+                      truncated: result.truncated,
+                    } as TerminalResult
+                  } else {
+                    lastTc.error = result.message
+                  }
+                } else if (lastTc) {
+                  if (result.status === "success" && result.results) {
+                    lastTc.results = result.results as SearchResult[]
+                  } else if (result.status === "error") {
+                    lastTc.error = result.message
+                  }
+                }
+              } catch { /* ignore */ }
+              setSearching(false)
+              setExecuting(false)
+              if (collectedToolCalls.length > 0) {
+                setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
+              }
+            } else if (event.type === "image_result") {
+              try {
+                const imgData = JSON.parse(event.content ?? "{}") as ImageResult
+                addImage(conversationId, assistantMessageId, imgData)
+              } catch { /* ignore */ }
+            } else if (event.type === "tool_error") {
+              setSearching(false)
+              setExecuting(false)
             } else if (event.type === "error") {
+              setThinking(false)
+              setSearching(false)
+              setExecuting(false)
               appendToken(conversationId, assistantMessageId, `\n\n[Error: ${event.content}]`)
               break
             } else if (event.type === "done") {
@@ -337,10 +415,10 @@ export function useStream() {
       }
     },
     [
-      addMessage, appendToken, setTitle, setMessageType, setToolCalls,
+      addMessage, appendToken, setTitle, setMessageType, setToolCalls, addImage,
       setStreaming, setThinking, setSearching, setExecuting, setCompressing, getActiveConversation,
       setPendingTerminalCommand, setAutoApproveTerminal, waitForApproval,
-      selectedModel, thinkingMode, webSearchMode, terminalMode,
+      selectedProvider, selectedModel, thinkingMode, webSearchMode, terminalMode,
     ]
   )
 

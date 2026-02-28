@@ -1,8 +1,12 @@
 import asyncio
 import json
+import logging
 import platform
 import re
+import uuid
 from typing import AsyncIterator, TypedDict, Literal
+
+log = logging.getLogger(__name__)
 
 from langchain_core.messages import (
     AnyMessage,
@@ -11,12 +15,12 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from config import settings
-from tools import ALL_TOOLS, web_search, terminal_execute
+from providers import get_llm
+from tools import ALL_TOOLS, web_search, terminal_execute, send_image
 
 
 # --- State ---
@@ -28,6 +32,7 @@ class GraphState(TypedDict):
     image_media_type: str | None
     message_type: Literal["simple", "summary_request", "system_instruction"]
     history_compressed: bool
+    provider: str
     model: str
     thinking_mode: bool
     web_search: bool
@@ -35,6 +40,13 @@ class GraphState(TypedDict):
     tool_calls_log: list[dict]
     tool_call_iterations: int
     has_pending_terminal: bool
+    # Per-request LLM settings
+    temperature: float
+    top_p: float
+    max_response_tokens: int | None
+    max_history_tokens: int
+    custom_system_prompt: str
+    max_iterations_limit: int
 
 
 # --- Helpers ---
@@ -46,6 +58,7 @@ def get_enabled_tools(state: dict) -> list:
         tools.append(web_search)
     if state.get("terminal_access"):
         tools.append(terminal_execute)
+        tools.append(send_image)
     return tools
 
 
@@ -54,27 +67,65 @@ def has_tools_enabled(state: dict) -> bool:
     return bool(state.get("web_search") or state.get("terminal_access"))
 
 
-def get_llm(model: str, temperature: float = 0.7, streaming: bool = False) -> ChatOpenAI:
-    return ChatOpenAI(
-        base_url=settings.lm_studio_url,
-        api_key="lm-studio",
-        model=model,
-        temperature=temperature,
-        streaming=streaming,
-        request_timeout=120,
-    )
+def _msg_tokens(m: AnyMessage) -> int:
+    """Estimate token count for a single message (chars / 3)."""
+    if isinstance(m.content, str):
+        return len(m.content) // 3
+    if isinstance(m.content, list):
+        total = 0
+        for block in m.content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                total += len(block.get("text", ""))
+        return total // 3
+    return 0
 
 
 def estimate_tokens(messages: list[AnyMessage]) -> int:
-    total = 0
-    for m in messages:
-        if isinstance(m.content, str):
-            total += len(m.content)
-        elif isinstance(m.content, list):
-            for block in m.content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    total += len(block.get("text", ""))
-    return total // 4
+    return sum(_msg_tokens(m) for m in messages)
+
+
+def _is_error_message(m: AnyMessage) -> bool:
+    """Check if a message is a backend error (not useful for context)."""
+    if isinstance(m, AIMessage) and isinstance(m.content, str):
+        return m.content.startswith("[Error:") or m.content.startswith("\n\n[Error:")
+    return False
+
+
+def truncate_history(messages: list[AnyMessage], max_tokens: int) -> list[AnyMessage]:
+    """Keep only the most recent messages that fit within max_tokens.
+
+    Drops backend error messages and trims from the oldest end first.
+    Always preserves at least the last 2 messages for minimal context.
+    """
+    # Filter out error messages — they waste tokens and confuse the model
+    cleaned = [m for m in messages if not _is_error_message(m)]
+
+    # If already within budget, return as-is
+    if estimate_tokens(cleaned) <= max_tokens:
+        return cleaned
+
+    # Keep adding messages from the end until we exceed the budget
+    result: list[AnyMessage] = []
+    budget = max_tokens
+    for m in reversed(cleaned):
+        cost = _msg_tokens(m)
+        if cost > budget and len(result) >= 2:
+            break
+        result.append(m)
+        budget -= cost
+
+    result.reverse()
+    return result
+
+
+_MAX_TOOL_RESULT_CHARS = 2000  # Max chars of tool output sent to LLM context
+
+
+def _truncate_tool_result(text: str, limit: int = _MAX_TOOL_RESULT_CHARS) -> str:
+    """Truncate a tool result string to fit within token budget."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... (truncated, {len(text)} total chars)"
 
 
 def build_system_prompt(
@@ -82,52 +133,37 @@ def build_system_prompt(
     thinking_mode: bool,
     web_search: bool = False,
     terminal_access: bool = False,
+    custom_system_prompt: str = "",
 ) -> str:
-    base = "You are a helpful and concise AI assistant."
+    base = custom_system_prompt.strip() if custom_system_prompt else "You are a helpful and concise AI assistant."
 
     if message_type == "summary_request":
-        base += " The user is asking for a summary. Provide a clear, structured, and concise summary."
+        base += " Provide a clear, structured summary."
     elif message_type == "system_instruction":
-        base += " The user is giving you an instruction about how you should behave. Acknowledge and follow it precisely."
+        base += " Follow the user's instruction precisely."
 
     if web_search:
         base += (
-            " You have access to a web_search tool. Use it ONLY when the user's question "
-            "requires up-to-date information, recent events, real-time data, current prices, "
-            "weather, news, or facts you are not confident about. For general knowledge, "
-            "coding help, or creative tasks, answer directly without searching."
+            " You have a web_search tool. Use it for current events, real-time data, "
+            "or facts you're unsure about. Answer directly for general knowledge."
         )
 
     if terminal_access:
         os_name = platform.system()
-        if os_name == "Windows":
-            os_hint = (
-                "The user is on Windows and commands run via PowerShell. "
-                "Use PowerShell cmdlets: Get-ChildItem (list files), Get-Content (read file), "
-                "Get-Process, Get-Service, Get-ComputerInfo, Test-Path, Select-Object, "
-                "Sort-Object, Format-Table, etc. Pipelines with | are allowed "
-                "(e.g. Get-ChildItem | Select-Object Name, Length). "
-                "Classic commands like dir, type, tree, git also work."
-            )
-        elif os_name == "Darwin":
-            os_hint = "The user is on macOS. Use Unix commands like ls, cat, grep, find."
-        else:
-            os_hint = f"The user is on {os_name}. Use Unix commands like ls, cat, grep, find."
         base += (
-            " You have access to a terminal_execute tool that can run read-only "
-            "shell commands on the user's machine. Use it when the user asks to "
-            "inspect files, check directory contents, view git status, read file "
-            "contents, or get system information. Only safe, read-only commands "
-            "are allowed. Commands have a 15-second timeout, so keep them fast. "
-            "NEVER use -Recurse on root directories (C:\\, D:\\, /) as it will "
-            "timeout scanning thousands of files. Always scope commands to specific "
-            "folders. If the user asks about a broad location, list the top-level "
-            "first, then drill down into specific subdirectories as needed. "
-            + os_hint +
-            " IMPORTANT: If a command fails or returns an error, do NOT give up. "
-            "Analyze the error, fix the command, and try again with the corrected version. "
-            "Only explain the error to the user if you have exhausted all alternatives."
+            " You have terminal_execute and send_image(file_path: str) tools. "
+            "ALWAYS call the tool — never simulate or fabricate output. "
+            "Retry on errors before explaining them. Avoid recursive scans on root dirs."
         )
+        if os_name == "Windows":
+            base += (
+                " terminal_execute has a 'shell' param: 'cmd' (default) or 'powershell'. "
+                "Use shell='cmd' for CMD syntax (dir /Q, type, tree, etc.). "
+                "Use shell='powershell' for PowerShell cmdlets (Get-ChildItem, Get-Content, etc.). "
+                "Do NOT mix syntaxes — CMD flags (/Q, /S) fail in PowerShell and vice-versa."
+            )
+        else:
+            base += " terminal_execute runs bash commands (15s timeout)."
 
     # thinking_mode is handled entirely by the model's native behavior
     _ = thinking_mode
@@ -165,6 +201,7 @@ def build_llm_messages(state: dict) -> list[AnyMessage]:
         state.get("thinking_mode", False),
         state.get("web_search", False),
         state.get("terminal_access", False),
+        state.get("custom_system_prompt", ""),
     )
     user_content = build_user_content(
         state["new_message"],
@@ -200,7 +237,8 @@ def node_pre_process(state: GraphState) -> GraphState:
 
 
 def node_check_history(state: GraphState) -> GraphState:
-    compressed = estimate_tokens(state["messages"]) > settings.max_history_tokens
+    max_hist = state.get("max_history_tokens", settings.max_history_tokens)
+    compressed = estimate_tokens(state["messages"]) > max_hist
     return {**state, "history_compressed": compressed}
 
 
@@ -211,7 +249,7 @@ async def node_compress_history(state: GraphState) -> GraphState:
         if isinstance(m.content, str)
     )
 
-    llm = get_llm(state["model"])
+    llm = get_llm(state.get("provider", "lm_studio"), state["model"], temperature=0.3)
     response = await llm.ainvoke([
         HumanMessage(content=(
             "Summarize the following conversation history concisely, "
@@ -229,21 +267,63 @@ async def node_compress_history(state: GraphState) -> GraphState:
     return {**state, "messages": compressed, "history_compressed": True}
 
 
+_SIMULATED_TOOL_PATTERN = re.compile(
+    r"\[Tool call:.*?\]"           # [Tool call: name(...)]
+    r"|<tool_call>.*?</tool_call>" # <tool_call>...</tool_call>
+    r"|✿FUNCTION✿"                # Some models use this marker
+    r"|```tool_code"               # ```tool_code blocks
+    , re.IGNORECASE | re.DOTALL
+)
+
+
 async def node_call_model(state: GraphState) -> GraphState:
     """Call the LLM, optionally with tools bound (non-streaming for tool detection)."""
+    iteration = state.get("tool_call_iterations", 0) + 1
+    max_iter = state.get("max_iterations_limit", settings.tool_call_max_iterations)
+    log.info(f"[CALL_MODEL] iteration {iteration}/{max_iter}, provider={state.get('provider')}, model={state.get('model')}")
     msgs = build_llm_messages(state)
-    llm = get_llm(state["model"])
+    llm = get_llm(
+        state.get("provider", "lm_studio"),
+        state["model"],
+        temperature=state.get("temperature", 0.3),
+        top_p=state.get("top_p", 1.0),
+        max_tokens=state.get("max_response_tokens"),
+    )
 
     enabled_tools = get_enabled_tools(state)
+    tools_bound = False
     if enabled_tools and settings.tools_enabled:
         try:
             llm_with_tools = llm.bind_tools(enabled_tools)
             response = await llm_with_tools.ainvoke(msgs)
+            tools_bound = True
+            has_tc = bool(getattr(response, "tool_calls", None))
+            content_preview = (response.content or "")[:200]
+            log.info(f"[CALL_MODEL] bind_tools OK — tool_calls: {has_tc}, content preview: {repr(content_preview)}")
+            if has_tc:
+                log.info(f"[CALL_MODEL] tool_calls detail: {response.tool_calls}")
         except Exception as e:
-            print(f"[CALL_MODEL] Tool binding failed, falling back: {e}")
-            response = await llm.ainvoke(msgs)
+            log.info(f"[CALL_MODEL] Tool binding failed, falling back without tools: {e}")
+            # Rebuild messages WITHOUT tool instructions to prevent the model
+            # from simulating tool output in plain text
+            fallback_state = {**state, "web_search": False, "terminal_access": False}
+            fallback_msgs = build_llm_messages(fallback_state)
+            response = await llm.ainvoke(fallback_msgs)
     else:
         response = await llm.ainvoke(msgs)
+
+    # Detect tool simulation: model wrote tool-call-like text instead of using actual tools
+    content = response.content or ""
+    if (
+        tools_bound
+        and not getattr(response, "tool_calls", None)
+        and _SIMULATED_TOOL_PATTERN.search(content)
+    ):
+        log.info(f"[CALL_MODEL] Detected simulated tool calls in text, stripping and retrying without tools")
+        # Retry without tool instructions so the model answers normally
+        fallback_state = {**state, "web_search": False, "terminal_access": False}
+        fallback_msgs = build_llm_messages(fallback_state)
+        response = await llm.ainvoke(fallback_msgs)
 
     return {
         **state,
@@ -274,6 +354,7 @@ async def node_tool_executor(state: GraphState) -> GraphState:
                 "status": "pending_approval",
                 "command": tc["args"].get("command", ""),
                 "working_directory": tc["args"].get("working_directory", "."),
+                "shell": tc["args"].get("shell", "cmd"),
             })
             tool_messages.append(
                 ToolMessage(content=pending, tool_call_id=tc["id"])
@@ -290,7 +371,10 @@ async def node_tool_executor(state: GraphState) -> GraphState:
         if not tool_fn:
             result = json.dumps({"status": "error", "message": f"Unknown tool: {tc['name']}"})
         else:
-            result = await asyncio.to_thread(tool_fn.invoke, tc["args"])
+            try:
+                result = await asyncio.to_thread(tool_fn.invoke, tc["args"])
+            except Exception as e:
+                result = json.dumps({"status": "error", "message": f"Tool error: {e}"})
 
         tool_messages.append(
             ToolMessage(content=str(result), tool_call_id=tc["id"])
@@ -334,9 +418,9 @@ def _clean_title(raw: str) -> str:
     return ""
 
 
-async def generate_title_from_message(model: str, user_message: str) -> str:
+async def generate_title_from_message(provider: str, model: str, user_message: str) -> str:
     """Generate a title based solely on the user message."""
-    llm = get_llm(model, temperature=0.1)
+    llm = get_llm(provider, model, temperature=0.6)
 
     try:
         response = await llm.ainvoke([
@@ -394,11 +478,12 @@ def route_after_tool(state: GraphState) -> str:
 def route_after_model(state: GraphState) -> str:
     """Route after LLM call: if tool_calls present, go to tool_node; otherwise END."""
     last_msg = state["messages"][-1]
+    max_iter = state.get("max_iterations_limit", settings.tool_call_max_iterations)
     if (
         has_tools_enabled(state)
         and hasattr(last_msg, "tool_calls")
         and last_msg.tool_calls
-        and state.get("tool_call_iterations", 0) < settings.tool_call_max_iterations
+        and state.get("tool_call_iterations", 0) < max_iter
     ):
         return "tool_node"
     return END
@@ -465,20 +550,40 @@ async def stream_graph_response(
     new_message: str,
     image_base64: str | None,
     image_media_type: str | None,
+    provider: str,
     model: str,
     thinking_mode: bool,
     web_search: bool = False,
     terminal_access: bool = False,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_response_tokens: int | None = None,
+    max_history_tokens: int | None = None,
+    system_prompt: str | None = None,
+    tool_call_max_iterations: int | None = None,
 ) -> AsyncIterator[str]:
+
+    from settings_store import get_settings as _get_settings
+    defaults = _get_settings()
+
+    eff_temperature = temperature if temperature is not None else defaults["temperature"]
+    eff_top_p = top_p if top_p is not None else defaults["top_p"]
+    eff_max_response = max_response_tokens if max_response_tokens is not None else defaults["max_response_tokens"]
+    eff_max_history = max_history_tokens if max_history_tokens is not None else defaults["max_history_tokens"]
+    eff_system_prompt = system_prompt if system_prompt is not None else defaults["system_prompt"]
+    eff_max_iterations = tool_call_max_iterations if tool_call_max_iterations is not None else defaults["tool_call_max_iterations"]
 
     def deserialize(m: dict) -> AnyMessage:
         if m["role"] == "user":
             return HumanMessage(content=m["content"])
         if m["role"] == "assistant":
             return AIMessage(content=m["content"])
-        return SystemMessage(content=m["content"])
+        return HumanMessage(content=m["content"])
 
-    history = [deserialize(m) for m in messages]
+    raw_history = [deserialize(m) for m in messages]
+    history = truncate_history(raw_history, eff_max_history)
+    if len(history) < len(raw_history):
+        log.info(f"[HISTORY] Truncated {len(raw_history)} → {len(history)} messages ({estimate_tokens(history)} tokens)")
 
     initial_state = {
         "messages": history,
@@ -487,6 +592,7 @@ async def stream_graph_response(
         "image_media_type": image_media_type,
         "message_type": "simple",
         "history_compressed": False,
+        "provider": provider,
         "model": model,
         "thinking_mode": thinking_mode,
         "web_search": web_search,
@@ -494,16 +600,35 @@ async def stream_graph_response(
         "tool_calls_log": [],
         "tool_call_iterations": 0,
         "has_pending_terminal": False,
+        "temperature": eff_temperature,
+        "top_p": eff_top_p,
+        "max_response_tokens": eff_max_response,
+        "max_history_tokens": eff_max_history,
+        "custom_system_prompt": eff_system_prompt,
+        "max_iterations_limit": eff_max_iterations,
     }
 
-    config = {"configurable": {"thread_id": thread_id}}
+    # Use a unique thread_id per request to avoid checkpoint state accumulation.
+    # The frontend already sends the full message history, so we don't need
+    # the checkpointer to carry state between requests.
+    config = {"configurable": {"thread_id": f"{thread_id}_{uuid.uuid4().hex[:8]}"}}
 
     # Emit compressing event if history will need compression
-    if estimate_tokens(history) > settings.max_history_tokens:
+    if estimate_tokens(history) > eff_max_history:
         yield f"data: {json.dumps({'type': 'compressing'})}\n\n"
 
+    # Always emit thinking_start so the frontend shows a loading indicator
+    # while the graph runs (especially important for the non-streaming tool path)
+    yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+
     # Run the graph
-    final_state = await compiled_graph.ainvoke(initial_state, config=config)
+    try:
+        final_state = await compiled_graph.ainvoke(initial_state, config=config)
+    except Exception as e:
+        log.error(f"[GRAPH ERROR] {type(e).__name__}: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'content': f'Graph error: {e}'})}\n\n"
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        return
 
     message_type = final_state.get("message_type", "simple")
     yield f"data: {json.dumps({'type': 'message_type', 'content': message_type})}\n\n"
@@ -521,8 +646,12 @@ async def stream_graph_response(
             if entry["name"] == "terminal_execute":
                 result_data = json.loads(entry["result"]) if isinstance(entry["result"], str) else entry["result"]
                 if result_data.get("status") == "pending_approval":
-                    # Emit pending event — frontend must approve before execution
-                    yield f"data: {json.dumps({'type': 'terminal_pending', 'content': json.dumps({'command': result_data['command'], 'working_directory': result_data.get('working_directory', '.')})})}\n\n"
+                    yield f"data: {json.dumps({'type': 'terminal_pending', 'content': json.dumps({'command': result_data['command'], 'working_directory': result_data.get('working_directory', '.'), 'shell': result_data.get('shell', 'cmd')})})}\n\n"
+                    continue
+            if entry["name"] == "send_image":
+                result_data = json.loads(entry["result"]) if isinstance(entry["result"], str) else entry["result"]
+                if result_data.get("status") == "success":
+                    yield f"data: {json.dumps({'type': 'image_result', 'content': json.dumps({'file_path': result_data['file_path'], 'media_type': result_data['media_type'], 'base64': result_data['base64']})})}\n\n"
                     continue
             yield f"data: {json.dumps({'type': 'tool_start', 'content': json.dumps({'name': entry['name'], 'args': entry['args']})})}\n\n"
             yield f"data: {json.dumps({'type': 'tool_result', 'content': entry['result']})}\n\n"
@@ -537,98 +666,78 @@ async def stream_graph_response(
             # We flatten the conversation to avoid sending AIMessage(tool_calls)
             # and ToolMessage to the LLM, which causes jinja template errors
             # in models that don't have tool-role templates.
-            tool_context = "\n\n".join(
-                f"[Tool call: {entry['name']}({entry['args']})]\n{entry['result']}"
-                for entry in tool_log
-            )
+            tool_context_parts = []
+            for entry in tool_log:
+                if entry["name"] == "send_image":
+                    result_data = json.loads(entry["result"]) if isinstance(entry["result"], str) else entry["result"]
+                    if result_data.get("status") == "success":
+                        tool_context_parts.append(f"The image '{result_data['file_path']}' was successfully loaded and is now visible to the user in the chat.")
+                    else:
+                        tool_context_parts.append(f"Attempted to read image but failed: {entry['result']}")
+                elif entry["name"] == "web_search":
+                    tool_context_parts.append(f"Web search for '{entry['args'].get('query', '')}' returned:\n{_truncate_tool_result(entry['result'])}")
+                else:
+                    tool_context_parts.append(f"Command '{entry['args'].get('command', '')}' returned:\n{_truncate_tool_result(entry['result'])}")
+            tool_context = "\n\n---\n\n".join(tool_context_parts)
             stream_msgs: list[AnyMessage] = [
                 SystemMessage(content=build_system_prompt(
                     message_type, thinking_mode,
                     web_search=web_search, terminal_access=terminal_access,
+                    custom_system_prompt=eff_system_prompt,
                 ))
             ]
             # Keep only HumanMessage/AIMessage from history (skip tool messages)
             for m in final_state["messages"]:
                 if isinstance(m, (HumanMessage, AIMessage)) and not getattr(m, "tool_calls", None):
                     stream_msgs.append(m)
-            # Inject tool results as context, then the user's question
-            stream_msgs.append(SystemMessage(content=(
-                "The following tool results were retrieved. "
-                "Use them to answer the user's question:\n\n" + tool_context
+            # Inject tool results as context (as HumanMessage to avoid
+            # Anthropic's "non-consecutive system messages" error)
+            stream_msgs.append(HumanMessage(content=(
+                "[INTERNAL CONTEXT — do NOT repeat this verbatim to the user. "
+                "Use the information to formulate your own natural response.]\n\n"
+                + tool_context
             )))
             stream_msgs.append(HumanMessage(content=build_user_content(
                 new_message, image_base64, image_media_type,
             )))
 
-            llm = get_llm(model, streaming=True)
+            llm = get_llm(provider, model, temperature=eff_temperature, top_p=eff_top_p, max_tokens=eff_max_response, streaming=True)
             async for chunk in llm.astream(stream_msgs):
                 token = chunk.content or ""
                 if token:
                     yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
         else:
-            # No tool calls were made (model answered directly even with tools available).
-            # Stream a fresh response so the user sees real token-by-token output.
-            if thinking_mode:
-                yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+            # No tool calls were made — emit the graph response directly
+            # instead of making another LLM call (saves tokens & latency).
+            graph_response_text = ""
+            for m in reversed(final_state.get("messages", [])):
+                if isinstance(m, AIMessage) and isinstance(m.content, str):
+                    graph_response_text = m.content
+                    break
 
-            stream_msgs: list[AnyMessage] = [
-                SystemMessage(content=build_system_prompt(
-                    message_type, thinking_mode,
-                    web_search=web_search, terminal_access=terminal_access,
-                ))
-            ]
-            stream_msgs.extend(history)
-            stream_msgs.append(HumanMessage(content=build_user_content(
-                new_message, image_base64, image_media_type,
-            )))
-
-            llm = get_llm(model, streaming=True)
-
-            emit_buffer = ""
-            inside_think = False
-
-            async for chunk in llm.astream(stream_msgs):
-                token = chunk.content or ""
-                if not token:
-                    continue
-
-                if thinking_mode:
-                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-                    continue
-
-                # Filter <think>...</think> blocks when thinking_mode is off
-                emit_buffer += token
-
-                while True:
-                    if inside_think:
-                        close = emit_buffer.find("</think")
-                        if close == -1:
-                            emit_buffer = ""
-                            break
-                        tag_end = emit_buffer.find(">", close)
-                        if tag_end == -1:
-                            break
-                        emit_buffer = emit_buffer[tag_end + 1:]
-                        inside_think = False
-                    else:
-                        open_pos = emit_buffer.find("<think")
-                        if open_pos == -1:
-                            if emit_buffer:
-                                yield f"data: {json.dumps({'type': 'token', 'content': emit_buffer})}\n\n"
-                                emit_buffer = ""
-                            break
-                        before = emit_buffer[:open_pos]
-                        if before:
-                            yield f"data: {json.dumps({'type': 'token', 'content': before})}\n\n"
-                        tag_end = emit_buffer.find(">", open_pos)
-                        if tag_end == -1:
-                            emit_buffer = emit_buffer[open_pos:]
-                            break
-                        emit_buffer = emit_buffer[tag_end + 1:]
-                        inside_think = True
-
-            if not thinking_mode and emit_buffer and not inside_think:
-                yield f"data: {json.dumps({'type': 'token', 'content': emit_buffer})}\n\n"
+            # Check for simulated tool calls
+            if _SIMULATED_TOOL_PATTERN.search(graph_response_text):
+                log.info("[STREAM] Model simulated tool calls — re-streaming without tool instructions")
+                stream_msgs: list[AnyMessage] = [
+                    SystemMessage(content=build_system_prompt(message_type, thinking_mode, custom_system_prompt=eff_system_prompt))
+                ]
+                stream_msgs.extend(history)
+                stream_msgs.append(HumanMessage(content=build_user_content(
+                    new_message, image_base64, image_media_type,
+                )))
+                llm = get_llm(provider, model, temperature=eff_temperature, top_p=eff_top_p, max_tokens=eff_max_response, streaming=True)
+                async for chunk in llm.astream(stream_msgs):
+                    token = chunk.content or ""
+                    if token:
+                        yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+            elif graph_response_text:
+                # Emit the already-generated response token by token
+                # (strip <think> blocks for non-thinking mode)
+                text = graph_response_text
+                if not thinking_mode:
+                    text = re.sub(r"<think[\s\S]*?</think>", "", text).strip()
+                if text:
+                    yield f"data: {json.dumps({'type': 'token', 'content': text})}\n\n"
 
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -640,14 +749,14 @@ async def stream_graph_response(
         if thinking_mode:
             yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
 
-        system_prompt = build_system_prompt(message_type, thinking_mode)
+        sys_prompt = build_system_prompt(message_type, thinking_mode, custom_system_prompt=eff_system_prompt)
         user_content = build_user_content(new_message, image_base64, image_media_type)
 
-        stream_msgs: list[AnyMessage] = [SystemMessage(content=system_prompt)]
+        stream_msgs: list[AnyMessage] = [SystemMessage(content=sys_prompt)]
         stream_msgs.extend(final_state["messages"])
         stream_msgs.append(HumanMessage(content=user_content))
 
-        llm = get_llm(model, streaming=True)
+        llm = get_llm(provider, model, temperature=eff_temperature, top_p=eff_top_p, max_tokens=eff_max_response, streaming=True)
 
         emit_buffer = ""
         inside_think = False

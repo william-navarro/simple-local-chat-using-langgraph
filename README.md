@@ -74,7 +74,7 @@ cd simple-local-chat-using-langgraph
 #### 2. Start LM Studio
 
 1. Open LM Studio
-2. Download and load a model (e.g., `deepseek/deepseek-r1-0528-qwen3-8b`)
+2. Download and load a model (e.g., `qwen3:latest`)
 3. Start the local server (default: `http://localhost:1234`)
 4. Make sure the server is running before proceeding
 

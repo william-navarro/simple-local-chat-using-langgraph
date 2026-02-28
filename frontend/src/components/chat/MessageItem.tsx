@@ -1,10 +1,10 @@
-import { Brain, Globe, Terminal, Tag, Bot, User, Copy, Check } from "lucide-react"
-import { useState } from "react"
+import { Brain, Globe, Terminal, Tag, Bot, User, Copy, Check, X } from "lucide-react"
+import { useState, useEffect, useCallback } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter"
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism"
-import type { Message, ToolCallInfo } from "../../types"
+import type { Message, ToolCallInfo, ImageResult } from "../../types"
 
 interface MessageItemProps {
   message: Message
@@ -216,7 +216,7 @@ function ThinkingBlock({ content, isStreaming }: { content: string; isStreaming:
 }
 
 function SearchBlock({ toolCalls }: { toolCalls: ToolCallInfo[] }) {
-  const searchCalls = toolCalls.filter((tc) => tc.name !== "terminal_execute")
+  const searchCalls = toolCalls.filter((tc) => tc.name === "web_search")
   if (searchCalls.length === 0) return null
 
   return (
@@ -273,6 +273,11 @@ function TerminalBlock({ toolCalls }: { toolCalls: ToolCallInfo[] }) {
         <span className="text-xs font-medium tracking-wide text-green-400">
           terminal
         </span>
+        {terminalCalls[0]?.shell && (
+          <span className="text-xs text-green-500/50 font-mono">
+            {terminalCalls[0].shell === "powershell" ? "PowerShell" : "CMD"}
+          </span>
+        )}
       </div>
       <div className="px-3 py-2 space-y-2">
         {terminalCalls.map((tc, i) => (
@@ -311,6 +316,68 @@ function TerminalBlock({ toolCalls }: { toolCalls: ToolCallInfo[] }) {
         ))}
       </div>
     </div>
+  )
+}
+
+function ImageBlock({ images }: { images: ImageResult[] }) {
+  const [expanded, setExpanded] = useState<ImageResult | null>(null)
+
+  const close = useCallback(() => setExpanded(null), [])
+
+  useEffect(() => {
+    if (!expanded) return
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close()
+    }
+    window.addEventListener("keydown", handleKey)
+    return () => window.removeEventListener("keydown", handleKey)
+  }, [expanded, close])
+
+  if (images.length === 0) return null
+
+  return (
+    <>
+      <div className="my-2 space-y-2">
+        {images.map((img, i) => (
+          <div key={i} className="rounded-lg overflow-hidden border border-zinc-700">
+            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-900 border-b border-zinc-700">
+              <span className="text-xs text-zinc-500 font-mono truncate">
+                {img.file_path.split(/[/\\]/).pop()}
+              </span>
+            </div>
+            <img
+              src={`data:${img.media_type};base64,${img.base64}`}
+              alt={img.file_path}
+              className="max-w-full max-h-96 object-contain bg-zinc-950 p-1 cursor-pointer hover:opacity-80 transition-opacity"
+              onClick={() => setExpanded(img)}
+            />
+          </div>
+        ))}
+      </div>
+
+      {expanded && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+          onClick={close}
+        >
+          <button
+            onClick={close}
+            className="absolute top-4 right-4 p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors z-10"
+          >
+            <X size={20} />
+          </button>
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-xs text-zinc-500 font-mono truncate max-w-[80vw]">
+            {expanded.file_path}
+          </div>
+          <img
+            src={`data:${expanded.media_type};base64,${expanded.base64}`}
+            alt={expanded.file_path}
+            className="max-w-[90vw] max-h-[90vh] object-contain"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      )}
+    </>
   )
 }
 
@@ -412,6 +479,9 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
                   <SearchBlock toolCalls={message.toolCalls} />
                   <TerminalBlock toolCalls={message.toolCalls} />
                 </>
+              )}
+              {message.images && message.images.length > 0 && (
+                <ImageBlock images={message.images} />
               )}
               {parts?.map((part, i) =>
                 part.type === "thinking" ? (

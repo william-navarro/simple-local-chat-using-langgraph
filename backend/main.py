@@ -1,20 +1,31 @@
 import json
-import httpx
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+
 from config import settings
+from pathlib import Path
+
 from schemas import (
     ChatRequest, TitleRequest, TitleResponse, ErrorResponse,
     TerminalExecuteRequest, TerminalExecuteResponse,
+    GlobalSettings, ApiKeysUpdate, ApiKeysResponse,
 )
 from graph import stream_graph_response, generate_title_from_message
+from providers import check_provider_status, fetch_provider_models, list_all_providers
+from settings_store import get_settings, update_settings
 from tools import execute_terminal_command
 
 app = FastAPI(
     title="LangGraph Chat API",
-    description="Chat backend powered by LangGraph and LM Studio",
+    description="Chat backend powered by LangGraph with multi-provider LLM support",
     version="1.0.0",
 )
 
@@ -32,30 +43,34 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/providers")
+async def providers_list():
+    return await list_all_providers()
+
+
+@app.get("/providers/{provider}/status")
+async def provider_status(provider: str):
+    online = await check_provider_status(provider)
+    return {"online": online}
+
+
+@app.get("/providers/{provider}/models")
+async def provider_models(provider: str):
+    models = await fetch_provider_models(provider)
+    return {"models": models}
+
+
+# Backward-compat aliases
 @app.get("/lmstudio/status")
 async def lmstudio_status():
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(f"{settings.lm_studio_url}/models")
-            if response.status_code == 200:
-                return {"online": True}
-    except Exception:
-        pass
-    return {"online": False}
+    online = await check_provider_status("lm_studio")
+    return {"online": online}
 
 
 @app.get("/lmstudio/models")
 async def lmstudio_models():
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(f"{settings.lm_studio_url}/models")
-            if response.status_code == 200:
-                data = response.json()
-                models = [m["id"] for m in data.get("data", [])]
-                return {"models": models}
-    except Exception:
-        pass
-    return {"models": []}
+    models = await fetch_provider_models("lm_studio")
+    return {"models": models}
 
 
 @app.post(
@@ -64,7 +79,7 @@ async def lmstudio_models():
 )
 async def chat_title(request: TitleRequest):
     try:
-        title = await generate_title_from_message(request.model, request.message)
+        title = await generate_title_from_message(request.provider, request.model, request.message)
     except Exception as e:
         print(f"[TITLE ENDPOINT] Error: {e}")
         words = request.message.split()[:6]
@@ -86,10 +101,17 @@ async def chat_stream(request: ChatRequest):
                 new_message=request.new_message,
                 image_base64=request.image_base64,
                 image_media_type=request.image_media_type,
+                provider=request.provider,
                 model=request.model,
                 thinking_mode=request.thinking_mode,
                 web_search=request.web_search,
                 terminal_access=request.terminal_access,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                max_response_tokens=request.max_response_tokens,
+                max_history_tokens=request.max_history_tokens,
+                system_prompt=request.system_prompt,
+                tool_call_max_iterations=request.tool_call_max_iterations,
             ):
                 yield chunk
         except Exception as e:
@@ -110,5 +132,76 @@ async def chat_stream(request: ChatRequest):
     response_model=TerminalExecuteResponse,
 )
 async def terminal_execute_endpoint(request: TerminalExecuteRequest):
-    result = execute_terminal_command(request.command, request.working_directory)
+    result = execute_terminal_command(request.command, request.working_directory, request.shell)
     return TerminalExecuteResponse(**result)
+
+
+# --- Settings endpoints ---
+
+def _mask_key(key: str) -> str:
+    if not key or len(key) < 8:
+        return "***" if key else ""
+    return key[:3] + "..." + key[-4:]
+
+
+def _write_env_keys(body: ApiKeysUpdate) -> None:
+    """Patch .env file with updated API keys."""
+    env_path = Path(__file__).parent / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+
+    key_map = {
+        "OPENAI_API_KEY": body.openai_api_key,
+        "ANTHROPIC_API_KEY": body.anthropic_api_key,
+        "GOOGLE_API_KEY": body.google_api_key,
+    }
+
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+    for line in lines:
+        replaced = False
+        for env_key, value in key_map.items():
+            if value is not None and line.strip().startswith(f"{env_key}="):
+                new_lines.append(f"{env_key}={value}")
+                updated_keys.add(env_key)
+                replaced = True
+                break
+        if not replaced:
+            new_lines.append(line)
+
+    for env_key, value in key_map.items():
+        if value is not None and env_key not in updated_keys:
+            new_lines.append(f"{env_key}={value}")
+
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+
+@app.get("/settings")
+async def settings_get():
+    return GlobalSettings(**get_settings())
+
+
+@app.put("/settings")
+async def settings_put(body: GlobalSettings):
+    updated = update_settings(body.model_dump())
+    return GlobalSettings(**updated)
+
+
+@app.get("/settings/keys", response_model=ApiKeysResponse)
+async def settings_keys_get():
+    return ApiKeysResponse(
+        openai_api_key=_mask_key(settings.openai_api_key),
+        anthropic_api_key=_mask_key(settings.anthropic_api_key),
+        google_api_key=_mask_key(settings.google_api_key),
+    )
+
+
+@app.put("/settings/keys")
+async def settings_keys_put(body: ApiKeysUpdate):
+    if body.openai_api_key is not None:
+        settings.openai_api_key = body.openai_api_key
+    if body.anthropic_api_key is not None:
+        settings.anthropic_api_key = body.anthropic_api_key
+    if body.google_api_key is not None:
+        settings.google_api_key = body.google_api_key
+    _write_env_keys(body)
+    return {"status": "ok"}
