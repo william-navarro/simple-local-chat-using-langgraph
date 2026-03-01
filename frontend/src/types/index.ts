@@ -1,4 +1,4 @@
-export type LLMProvider = "lm_studio" | "ollama" | "openai" | "anthropic" | "google"
+export type LLMProvider = "lm_studio" | "ollama" | "openai" | "anthropic" | "google" | "cli_proxy"
 
 export interface ProviderInfo {
   id: LLMProvider
@@ -128,4 +128,10 @@ export interface ApiKeysState {
   openai_api_key: string
   anthropic_api_key: string
   google_api_key: string
+}
+
+export interface ProviderUrlsState {
+  lm_studio_url: string
+  ollama_url: string
+  cli_proxy_url: string
 }

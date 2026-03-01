@@ -79,3 +79,15 @@ class ApiKeysResponse(BaseModel):
     openai_api_key: str
     anthropic_api_key: str
     google_api_key: str
+
+
+class ProviderUrlsUpdate(BaseModel):
+    lm_studio_url: str | None = None
+    ollama_url: str | None = None
+    cli_proxy_url: str | None = None
+
+
+class ProviderUrlsResponse(BaseModel):
+    lm_studio_url: str
+    ollama_url: str
+    cli_proxy_url: str

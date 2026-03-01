@@ -1,5 +1,6 @@
 import json
 import logging
+import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -17,9 +18,11 @@ from schemas import (
     ChatRequest, TitleRequest, TitleResponse, ErrorResponse,
     TerminalExecuteRequest, TerminalExecuteResponse,
     GlobalSettings, ApiKeysUpdate, ApiKeysResponse,
+    ProviderUrlsUpdate, ProviderUrlsResponse,
 )
 from graph import stream_graph_response, generate_title_from_message
 from providers import check_provider_status, fetch_provider_models, list_all_providers
+from model_cache import refresh_all_cloud_models
 from settings_store import get_settings, update_settings
 from tools import execute_terminal_command
 
@@ -36,6 +39,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def on_startup():
+    """Refresh cloud model lists on backend startup."""
+    results = await refresh_all_cloud_models()
+    for provider, models in results.items():
+        logging.info(f"[STARTUP] {provider}: {len(models)} models cached")
 
 
 @app.get("/health")
@@ -58,6 +69,16 @@ async def provider_status(provider: str):
 async def provider_models(provider: str):
     models = await fetch_provider_models(provider)
     return {"models": models}
+
+
+@app.post("/providers/refresh-models")
+async def providers_refresh_models():
+    """Force refresh of cloud provider model lists."""
+    results = await refresh_all_cloud_models()
+    return {
+        provider: len(models)
+        for provider, models in results.items()
+    }
 
 
 # Backward-compat aliases
@@ -144,16 +165,10 @@ def _mask_key(key: str) -> str:
     return key[:3] + "..." + key[-4:]
 
 
-def _write_env_keys(body: ApiKeysUpdate) -> None:
-    """Patch .env file with updated API keys."""
+def _patch_env_file(key_map: dict[str, str | None]) -> None:
+    """Patch .env file with updated values."""
     env_path = Path(__file__).parent / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-
-    key_map = {
-        "OPENAI_API_KEY": body.openai_api_key,
-        "ANTHROPIC_API_KEY": body.anthropic_api_key,
-        "GOOGLE_API_KEY": body.google_api_key,
-    }
 
     updated_keys: set[str] = set()
     new_lines: list[str] = []
@@ -186,6 +201,8 @@ async def settings_put(body: GlobalSettings):
     return GlobalSettings(**updated)
 
 
+# --- API Keys ---
+
 @app.get("/settings/keys", response_model=ApiKeysResponse)
 async def settings_keys_get():
     return ApiKeysResponse(
@@ -203,5 +220,94 @@ async def settings_keys_put(body: ApiKeysUpdate):
         settings.anthropic_api_key = body.anthropic_api_key
     if body.google_api_key is not None:
         settings.google_api_key = body.google_api_key
-    _write_env_keys(body)
+    _patch_env_file({
+        "OPENAI_API_KEY": body.openai_api_key,
+        "ANTHROPIC_API_KEY": body.anthropic_api_key,
+        "GOOGLE_API_KEY": body.google_api_key,
+    })
     return {"status": "ok"}
+
+
+# --- Provider URLs ---
+
+@app.get("/settings/urls", response_model=ProviderUrlsResponse)
+async def settings_urls_get():
+    return ProviderUrlsResponse(
+        lm_studio_url=settings.lm_studio_url,
+        ollama_url=settings.ollama_url,
+        cli_proxy_url=settings.cli_proxy_url,
+    )
+
+
+@app.put("/settings/urls")
+async def settings_urls_put(body: ProviderUrlsUpdate):
+    if body.lm_studio_url is not None:
+        settings.lm_studio_url = body.lm_studio_url
+    if body.ollama_url is not None:
+        settings.ollama_url = body.ollama_url
+    if body.cli_proxy_url is not None:
+        settings.cli_proxy_url = body.cli_proxy_url
+    _patch_env_file({
+        "LM_STUDIO_URL": body.lm_studio_url,
+        "OLLAMA_URL": body.ollama_url,
+        "CLI_PROXY_URL": body.cli_proxy_url,
+    })
+    return {"status": "ok"}
+
+
+# --- CLI Proxy auth ---
+
+@app.get("/cli-proxy/auth-status")
+async def cli_proxy_auth_status():
+    """Check if CLI Proxy is running and authenticated (token valid)."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(
+                f"{settings.cli_proxy_url}/models",
+                headers={"Authorization": "Bearer sk-dummy"},
+            )
+            if resp.status_code == 200:
+                return {"authenticated": True, "running": True}
+            return {"authenticated": False, "running": True, "status_code": resp.status_code}
+    except Exception:
+        return {"authenticated": False, "running": False}
+
+
+@app.post("/cli-proxy/login")
+async def cli_proxy_login():
+    """Trigger CLI Proxy OAuth login (opens browser on the server machine)."""
+    import asyncio
+    import shutil
+
+    exe = shutil.which("cli-proxy-api") or shutil.which("cli-proxy-api.exe")
+    if not exe:
+        # Try relative bin/ path
+        bin_dir = Path(__file__).parent.parent / "bin"
+        for name in ("cli-proxy-api.exe", "cli-proxy-api"):
+            candidate = bin_dir / name
+            if candidate.exists():
+                exe = str(candidate)
+                break
+
+    if not exe:
+        return {"status": "error", "message": "cli-proxy-api binary not found"}
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exe, "-login",
+            cwd=str(Path(exe).parent),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # Wait up to 120s for the OAuth flow to complete
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        if proc.returncode == 0:
+            return {"status": "ok", "message": "Login successful"}
+        return {
+            "status": "error",
+            "message": stderr.decode(errors="replace").strip() or "Login failed",
+        }
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "Login timed out (120s). Try again."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}

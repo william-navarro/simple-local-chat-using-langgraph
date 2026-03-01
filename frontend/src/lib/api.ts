@@ -1,4 +1,4 @@
-import type { ChatRequest, StreamEvent, TerminalResult, ProviderInfo, GlobalSettings, ApiKeysState } from "../types"
+import type { ChatRequest, StreamEvent, TerminalResult, ProviderInfo, GlobalSettings, ApiKeysState, ProviderUrlsState } from "../types"
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 
@@ -153,4 +153,41 @@ export async function updateApiKeys(keys: Partial<ApiKeysState>): Promise<void> 
     body: JSON.stringify(keys),
   })
   if (!res.ok) throw new Error("Failed to update API keys")
+}
+
+// --- Provider URLs ---
+
+export async function fetchProviderUrls(): Promise<ProviderUrlsState> {
+  const res = await fetch(`${BASE_URL}/settings/urls`)
+  if (!res.ok) throw new Error("Failed to fetch provider URLs")
+  return res.json()
+}
+
+export async function updateProviderUrls(urls: Partial<ProviderUrlsState>): Promise<void> {
+  const res = await fetch(`${BASE_URL}/settings/urls`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(urls),
+  })
+  if (!res.ok) throw new Error("Failed to update provider URLs")
+}
+
+// --- CLI Proxy ---
+
+export async function fetchCliProxyAuthStatus(): Promise<{ authenticated: boolean; running: boolean }> {
+  try {
+    const res = await fetch(`${BASE_URL}/cli-proxy/auth-status`)
+    if (!res.ok) return { authenticated: false, running: false }
+    return res.json()
+  } catch {
+    return { authenticated: false, running: false }
+  }
+}
+
+export async function triggerCliProxyLogin(): Promise<{ status: string; message: string }> {
+  const res = await fetch(`${BASE_URL}/cli-proxy/login`, {
+    method: "POST",
+  })
+  if (!res.ok) throw new Error("Failed to trigger CLI Proxy login")
+  return res.json()
 }

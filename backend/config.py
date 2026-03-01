@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     lm_studio_url: str = "http://localhost:1234/v1"
     lm_studio_model: str = "local-model"
     ollama_url: str = "http://localhost:11434/v1"
+    cli_proxy_url: str = "http://localhost:8090/v1"
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     google_api_key: str = ""

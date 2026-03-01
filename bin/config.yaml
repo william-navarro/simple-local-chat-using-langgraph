@@ -1,0 +1,27 @@
+# Configurações do Servidor
+host: "127.0.0.1"
+port: 8090
+auth-dir: "data"
+
+# Chave que o LangGraph Chat usará para acessar o Proxy
+api-keys:
+  - "sk-dummy"
+
+# --- CONFIGURAÇÃO DOS PROVIDERS (MÉTODO AUTH) ---
+
+gemini-auth:
+  - enable: true
+
+claude-auth:
+  - enable: true
+
+codex-auth:
+  - enable: true
+
+# Interface de gerenciamento no navegador
+manager:
+  enable: true
+  port: 8318
+
+routing:
+  strategy: "round-robin"

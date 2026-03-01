@@ -4,8 +4,9 @@ node_modules/
 # Environment variables
 .env
 
-# Runtime settings (user-specific)
+# Runtime settings and cache (user-specific)
 backend/settings.json
+backend/data/
 
 # Python
 __pycache__/
@@ -21,6 +22,12 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# CLI Proxy (binary + runtime data)
+bin/cli-proxy-api*
+bin/data/
+bin/static/
+bin/logs/
 
 # Claude
 .claude/

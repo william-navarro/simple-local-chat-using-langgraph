@@ -7,14 +7,16 @@ import { GeneralTab } from "./GeneralTab"
 import { SystemPromptTab } from "./SystemPromptTab"
 import { ToolsTab } from "./ToolsTab"
 import { ApiKeysTab } from "./ApiKeysTab"
+import { ProviderUrlsTab } from "./ProviderUrlsTab"
 
-type Tab = "general" | "prompt" | "tools" | "keys"
+type Tab = "general" | "prompt" | "tools" | "keys" | "urls"
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "general", label: "General" },
   { id: "prompt", label: "System Prompt" },
   { id: "tools", label: "Tools" },
   { id: "keys", label: "API Keys" },
+  { id: "urls", label: "Provider URLs" },
 ]
 
 const DEFAULT_SETTINGS: GlobalSettings = {
@@ -146,6 +148,7 @@ export function SettingsModal() {
           {tab === "prompt" && <SystemPromptTab settings={draft} onChange={handleChange} />}
           {tab === "tools" && <ToolsTab settings={draft} onChange={handleChange} />}
           {tab === "keys" && <ApiKeysTab />}
+          {tab === "urls" && <ProviderUrlsTab />}
         </div>
 
         {/* Footer */}
@@ -158,7 +161,7 @@ export function SettingsModal() {
               <RotateCcw size={12} />
               Reset
             </button>
-            {activeConversationId && tab !== "keys" && (
+            {activeConversationId && tab !== "keys" && tab !== "urls" && (
               <label className="flex items-center gap-2 text-xs text-zinc-500 cursor-pointer">
                 <input
                   type="checkbox"
@@ -177,7 +180,7 @@ export function SettingsModal() {
             >
               Cancel
             </button>
-            {tab !== "keys" && (
+            {tab !== "keys" && tab !== "urls" && (
               <button
                 onClick={handleSave}
                 disabled={saving}

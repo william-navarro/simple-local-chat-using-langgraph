@@ -8,6 +8,7 @@ import type { LLMProvider } from "../../types"
 const PROVIDER_LABELS: Record<LLMProvider, string> = {
   lm_studio: "LM Studio",
   ollama: "Ollama",
+  cli_proxy: "CLI Proxy",
   openai: "OpenAI",
   anthropic: "Anthropic",
   google: "Google",

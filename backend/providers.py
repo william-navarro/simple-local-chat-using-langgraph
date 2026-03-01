@@ -5,11 +5,13 @@ from langchain_openai import ChatOpenAI
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from config import settings
+from model_cache import get_cloud_models
 
 
 class Provider(str, Enum):
     LM_STUDIO = "lm_studio"
     OLLAMA = "ollama"
+    CLI_PROXY = "cli_proxy"
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
@@ -42,6 +44,18 @@ def get_llm(
         return ChatOpenAI(
             base_url=settings.ollama_url,
             api_key="ollama",
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            streaming=streaming,
+            request_timeout=120,
+        )
+
+    if p == Provider.CLI_PROXY:
+        return ChatOpenAI(
+            base_url=settings.cli_proxy_url,
+            api_key="sk-dummy",
             model=model,
             temperature=temperature,
             top_p=top_p,
@@ -97,6 +111,7 @@ def get_llm(
 _LOCAL_PROVIDERS = {
     Provider.LM_STUDIO: lambda: settings.lm_studio_url,
     Provider.OLLAMA: lambda: settings.ollama_url,
+    Provider.CLI_PROXY: lambda: settings.cli_proxy_url,
 }
 
 _CLOUD_API_KEYS = {
@@ -105,33 +120,22 @@ _CLOUD_API_KEYS = {
     Provider.GOOGLE: lambda: settings.google_api_key,
 }
 
-_CLOUD_MODELS = {
-    Provider.OPENAI: [
-        "gpt-5.2",
-        "gpt-5.2-pro",
-        "gpt-4o",
-        "gpt-4o-mini",
-    ],
-    Provider.ANTHROPIC: [
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5-20251001",
-    ],
-    Provider.GOOGLE: [
-        "gemini-3.1-pro-preview",
-        "gemini-3-flash-preview",
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
-    ],
-}
 
 _PROVIDER_DISPLAY_NAMES = {
     Provider.LM_STUDIO: "LM Studio",
     Provider.OLLAMA: "Ollama",
+    Provider.CLI_PROXY: "CLI Proxy",
     Provider.OPENAI: "OpenAI",
     Provider.ANTHROPIC: "Anthropic",
     Provider.GOOGLE: "Google",
 }
+
+
+def _get_auth_headers(p: Provider) -> dict[str, str]:
+    """Return auth headers needed for provider status/model checks."""
+    if p == Provider.CLI_PROXY:
+        return {"Authorization": "Bearer sk-dummy"}
+    return {}
 
 
 async def check_provider_status(provider: str) -> bool:
@@ -141,7 +145,10 @@ async def check_provider_status(provider: str) -> bool:
         base_url = _LOCAL_PROVIDERS[p]()
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{base_url}/models")
+                resp = await client.get(
+                    f"{base_url}/models",
+                    headers=_get_auth_headers(p),
+                )
                 return resp.status_code == 200
         except Exception:
             return False
@@ -157,7 +164,10 @@ async def fetch_provider_models(provider: str) -> list[str]:
         base_url = _LOCAL_PROVIDERS[p]()
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{base_url}/models")
+                resp = await client.get(
+                    f"{base_url}/models",
+                    headers=_get_auth_headers(p),
+                )
                 if resp.status_code == 200:
                     data = resp.json()
                     return [m["id"] for m in data.get("data", [])]
@@ -165,7 +175,7 @@ async def fetch_provider_models(provider: str) -> list[str]:
             pass
         return []
 
-    return list(_CLOUD_MODELS.get(p, []))
+    return get_cloud_models(p.value)
 
 
 async def list_all_providers() -> list[dict]:

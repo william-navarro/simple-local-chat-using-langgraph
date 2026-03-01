@@ -30,15 +30,28 @@ pause
 exit /b 1
 
 :found
+
+set "CLIPROXY=%ROOT%bin"
+
 echo.
 echo =====================================================
 echo   LangGraph Chat - Iniciando servidores
 echo =====================================================
 echo.
-echo   Backend:  http://localhost:8000
-echo   Frontend: http://localhost:5173
-echo   Docs API: http://localhost:8000/docs
+echo   CLI Proxy: http://localhost:8090
+echo   Backend:   http://localhost:8000
+echo   Frontend:  http://localhost:5173
+echo   Docs API:  http://localhost:8000/docs
 echo.
+
+:: --- CLI Proxy (opcional) ---
+if exist "%CLIPROXY%\cli-proxy-api.exe" (
+    echo   Iniciando CLI Proxy...
+    start "LangGraph Chat - CLI Proxy" cmd /k "cd /d %CLIPROXY% && cli-proxy-api.exe -config config.yaml"
+    timeout /t 2 /nobreak >nul
+) else (
+    echo   CLI Proxy nao encontrado em bin\, pulando.
+)
 
 start "LangGraph Chat - Backend" cmd /k "call "%CONDA_BASE%\Scripts\activate.bat" "%CONDA_BASE%" && conda activate %CONDA_ENV_NAME% && cd /d %BACKEND% && uvicorn main:app --reload --port 8000"
 

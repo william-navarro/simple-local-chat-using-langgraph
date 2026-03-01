@@ -228,10 +228,21 @@ echo     Frontend configurado com sucesso.
 echo.
 echo [5/5] Iniciando servidores...
 echo.
-echo     Backend:  http://localhost:8000
-echo     Frontend: http://localhost:5173
-echo     Docs API: http://localhost:8000/docs
+echo     CLI Proxy: http://localhost:8090 (opcional)
+echo     Backend:   http://localhost:8000
+echo     Frontend:  http://localhost:5173
+echo     Docs API:  http://localhost:8000/docs
 echo.
+
+:: --- CLI Proxy (opcional) ---
+set "CLIPROXY=%ROOT%bin"
+if exist "%CLIPROXY%\cli-proxy-api.exe" (
+    echo     Iniciando CLI Proxy...
+    start "LangGraph Chat - CLI Proxy" cmd /k "cd /d %CLIPROXY% && cli-proxy-api.exe -config config.yaml"
+    timeout /t 2 /nobreak >nul
+) else (
+    echo     CLI Proxy nao encontrado em bin\, pulando.
+)
 
 start "LangGraph Chat - Backend" cmd /k "call "%CONDA_BASE%\Scripts\activate.bat" "%CONDA_BASE%" && conda activate %CONDA_ENV_NAME% && cd /d %BACKEND% && uvicorn main:app --reload --port 8000"
 
@@ -242,7 +253,7 @@ start "LangGraph Chat - Frontend" cmd /k "cd /d %FRONTEND% && npm run dev"
 timeout /t 3 /nobreak >nul
 start "" "http://localhost:5173"
 
-echo Ambos os servidores foram iniciados em janelas separadas.
+echo Todos os servidores foram iniciados em janelas separadas.
 echo Feche as janelas dos servidores para encerrar.
 echo.
 pause

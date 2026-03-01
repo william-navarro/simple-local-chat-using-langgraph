@@ -55,7 +55,7 @@ ALLOWED_COMMANDS = {
     "ls", "cat", "head", "tail", "find", "grep", "wc", "file",
     "which", "env", "printenv", "df", "du", "uname",
     # Windows CMD
-    "dir", "type", "where", "set", "systeminfo", "tree", "ver",
+    "dir", "type", "where", "set", "systeminfo", "tree", "ver", "if",
     # PowerShell cmdlets (read-only)
     "get-childitem", "get-content", "get-item", "get-itemproperty",
     "get-location", "get-process", "get-service", "get-command",
