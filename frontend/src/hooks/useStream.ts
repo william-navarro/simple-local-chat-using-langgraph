@@ -1,15 +1,9 @@
 import { useCallback, useRef } from "react"
 import { useChatStore } from "../store/useChatStore"
-import { streamChat, generateTitle, executeTerminalCommand } from "../lib/api"
+import { streamChat, resumeGraph, generateTitle, executeTerminalCommand } from "../lib/api"
 import type { MessageRole, ToolCallInfo, SearchResult, TerminalResult, ImageResult } from "../types"
 
 export type TerminalApprovalResult = "approve" | "approve_always" | "deny"
-
-const MAX_TOOL_OUTPUT = 2000
-function truncateToolOutput(text: string): string {
-  if (text.length <= MAX_TOOL_OUTPUT) return text
-  return text.slice(0, MAX_TOOL_OUTPUT) + `\n... (truncated, ${text.length} chars)`
-}
 
 export function useStream() {
   const {
@@ -115,8 +109,6 @@ export function useStream() {
 
       // Collect tool calls to set on the message after streaming
       const collectedToolCalls: ToolCallInfo[] = []
-      // Track terminal results for follow-up request
-      let terminalToolContext = ""
 
       try {
         const provider = selectedProvider || "lm_studio"
@@ -148,15 +140,18 @@ export function useStream() {
           } else if (event.type === "thinking_start") {
             setCompressing(false)
             setThinking(true)
-          } else if (event.type === "terminal_pending") {
+          } else if (event.type === "terminal_interrupt" || event.type === "terminal_pending") {
             setThinking(false)
             setSearching(false)
+            setExecuting(false)
 
             try {
               const pending = JSON.parse(event.content ?? "{}")
               const command = pending.command ?? ""
               const workingDirectory = pending.working_directory ?? "."
               const shell = pending.shell ?? "cmd"
+              // graph_thread_id is sent by backend for resume (unique per request)
+              const graphThreadId = pending.graph_thread_id ?? conversationId
 
               // Check auto-approve
               const autoApprove = useChatStore.getState().autoApproveTerminal
@@ -165,7 +160,6 @@ export function useStream() {
               if (autoApprove) {
                 decision = "approve"
               } else {
-                // Show dialog and wait for user decision
                 decision = await waitForApproval(command, workingDirectory, shell)
               }
 
@@ -175,13 +169,18 @@ export function useStream() {
                 setAutoApproveTerminal(true)
               }
 
-              if (decision === "approve" || decision === "approve_always") {
-                // Execute the command
+              const approved = decision === "approve" || decision === "approve_always"
+              let execResult: Record<string, unknown> | undefined
+
+              if (approved) {
+                // Execute the command locally and pass result to graph resume
                 setExecuting(true)
                 const result = await executeTerminalCommand(command, workingDirectory, shell)
                 setExecuting(false)
 
                 if (abortController.signal.aborted) break
+
+                execResult = result as unknown as Record<string, unknown>
 
                 const tcInfo: ToolCallInfo = {
                   name: "terminal_execute",
@@ -198,17 +197,13 @@ export function useStream() {
                     stderr: result.stderr ?? "",
                     truncated: result.truncated ?? false,
                   }
-                  const truncated = truncateToolOutput(JSON.stringify(result))
-                  terminalToolContext += `\n\n[terminal_execute("${command}")]\n${truncated}`
                 } else {
                   tcInfo.error = result.message ?? "Execution failed"
-                  terminalToolContext += `\n\n[terminal_execute("${command}")]\nError: ${result.message ?? "failed"}`
                 }
 
                 collectedToolCalls.push(tcInfo)
                 setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
               } else {
-                // User denied
                 const tcInfo: ToolCallInfo = {
                   name: "terminal_execute",
                   query: "",
@@ -218,7 +213,185 @@ export function useStream() {
                 }
                 collectedToolCalls.push(tcInfo)
                 setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
-                terminalToolContext += `\n\n[terminal_execute("${command}")]\nDenied by user.`
+              }
+
+              // Resume the graph and handle chained terminal interrupts
+              let currentGraphThreadId = graphThreadId
+              let currentApproved = approved
+              let currentExecResult = execResult
+
+              // Loop to handle chained terminal commands (LLM may request multiple)
+              // eslint-disable-next-line no-constant-condition
+              while (true) {
+                const resumeAbort = new AbortController()
+                abortRef.current = resumeAbort
+
+                const resumeProvider = selectedProvider || "lm_studio"
+                const resumeGenerator = resumeGraph(
+                  currentGraphThreadId,
+                  currentApproved,
+                  currentExecResult,
+                  resumeProvider,
+                  model,
+                  resumeAbort.signal,
+                )
+
+                let gotNestedInterrupt = false
+
+                for await (const resumeEvent of resumeGenerator) {
+                  if (resumeAbort.signal.aborted) break
+
+                  if (resumeEvent.type === "terminal_interrupt") {
+                    // Another terminal command — handle it in the next iteration
+                    setThinking(false)
+                    setSearching(false)
+                    setExecuting(false)
+
+                    try {
+                      const nestedPending = JSON.parse(resumeEvent.content ?? "{}")
+                      const nestedCommand = nestedPending.command ?? ""
+                      const nestedWd = nestedPending.working_directory ?? "."
+                      const nestedShell = nestedPending.shell ?? "cmd"
+                      currentGraphThreadId = nestedPending.graph_thread_id ?? currentGraphThreadId
+
+                      const nestedAutoApprove = useChatStore.getState().autoApproveTerminal
+                      let nestedDecision: TerminalApprovalResult
+                      if (nestedAutoApprove) {
+                        nestedDecision = "approve"
+                      } else {
+                        nestedDecision = await waitForApproval(nestedCommand, nestedWd, nestedShell)
+                      }
+
+                      if (resumeAbort.signal.aborted) break
+
+                      if (nestedDecision === "approve_always") {
+                        setAutoApproveTerminal(true)
+                      }
+
+                      currentApproved = nestedDecision === "approve" || nestedDecision === "approve_always"
+                      currentExecResult = undefined
+
+                      if (currentApproved) {
+                        setExecuting(true)
+                        const nestedResult = await executeTerminalCommand(nestedCommand, nestedWd, nestedShell)
+                        setExecuting(false)
+
+                        if (resumeAbort.signal.aborted) break
+
+                        currentExecResult = nestedResult as unknown as Record<string, unknown>
+
+                        const nestedTcInfo: ToolCallInfo = {
+                          name: "terminal_execute",
+                          query: "",
+                          command: nestedCommand,
+                          shell: nestedShell,
+                        }
+                        if (nestedResult.status === "success") {
+                          nestedTcInfo.terminalResult = {
+                            command: nestedResult.command,
+                            exit_code: nestedResult.exit_code ?? 0,
+                            stdout: nestedResult.stdout ?? "",
+                            stderr: nestedResult.stderr ?? "",
+                            truncated: nestedResult.truncated ?? false,
+                          }
+                        } else {
+                          nestedTcInfo.error = nestedResult.message ?? "Execution failed"
+                        }
+                        collectedToolCalls.push(nestedTcInfo)
+                        setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
+                      } else {
+                        collectedToolCalls.push({
+                          name: "terminal_execute",
+                          query: "",
+                          command: nestedCommand,
+                          shell: nestedShell,
+                          error: "Command rejected by user",
+                        })
+                        setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
+                      }
+
+                      gotNestedInterrupt = true
+                    } catch {
+                      setExecuting(false)
+                    }
+                    break  // break inner for-loop to resume again in while-loop
+                  } else if (resumeEvent.type === "token") {
+                    setThinking(false)
+                    setSearching(false)
+                    setExecuting(false)
+                    appendToken(conversationId, assistantMessageId, resumeEvent.content ?? "")
+                  } else if (resumeEvent.type === "thinking_start") {
+                    setThinking(true)
+                  } else if (resumeEvent.type === "tool_start") {
+                    setThinking(false)
+                    try {
+                      const info = JSON.parse(resumeEvent.content ?? "{}")
+                      if (info.name === "terminal_execute") {
+                        // Don't add to collectedToolCalls — the nested terminal_interrupt
+                        // handler will add the entry with proper result data
+                        setExecuting(true)
+                      } else {
+                        setSearching(true)
+                        collectedToolCalls.push({
+                          name: info.name ?? "unknown",
+                          query: info.args?.query ?? "",
+                          command: info.args?.command ?? "",
+                        })
+                      }
+                    } catch { /* ignore */ }
+                  } else if (resumeEvent.type === "tool_result") {
+                    try {
+                      const result = JSON.parse(resumeEvent.content ?? "{}")
+                      const lastTc = collectedToolCalls[collectedToolCalls.length - 1]
+                      if (lastTc?.name === "terminal_execute") {
+                        if (result.status === "success") {
+                          lastTc.terminalResult = {
+                            command: result.command,
+                            exit_code: result.exit_code,
+                            stdout: result.stdout,
+                            stderr: result.stderr,
+                            truncated: result.truncated,
+                          } as TerminalResult
+                        } else {
+                          lastTc.error = result.message
+                        }
+                      } else if (lastTc) {
+                        if (result.status === "success" && result.results) {
+                          lastTc.results = result.results as SearchResult[]
+                        } else if (result.status === "error") {
+                          lastTc.error = result.message
+                        }
+                      }
+                    } catch { /* ignore */ }
+                    setSearching(false)
+                    setExecuting(false)
+                    if (collectedToolCalls.length > 0) {
+                      setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
+                    }
+                  } else if (resumeEvent.type === "image_result") {
+                    try {
+                      const imgData = JSON.parse(resumeEvent.content ?? "{}") as ImageResult
+                      addImage(conversationId, assistantMessageId, imgData)
+                    } catch { /* ignore */ }
+                  } else if (resumeEvent.type === "message_type") {
+                    setMessageType(
+                      conversationId,
+                      assistantMessageId,
+                      (resumeEvent.content ?? "simple") as "simple" | "summary_request" | "system_instruction"
+                    )
+                  } else if (resumeEvent.type === "error") {
+                    setThinking(false)
+                    setSearching(false)
+                    setExecuting(false)
+                    appendToken(conversationId, assistantMessageId, `\n\n[Error: ${resumeEvent.content}]`)
+                    break
+                  } else if (resumeEvent.type === "done") {
+                    break
+                  }
+                }
+
+                // If no nested interrupt, we're done with the resume chain
+                if (!gotNestedInterrupt || resumeAbort.signal.aborted) break
               }
             } catch {
               setExecuting(false)
@@ -228,12 +401,9 @@ export function useStream() {
             try {
               const info = JSON.parse(event.content ?? "{}")
               if (info.name === "terminal_execute") {
+                // Don't add to collectedToolCalls here — the terminal_interrupt
+                // handler will add the entry with proper result data
                 setExecuting(true)
-                collectedToolCalls.push({
-                  name: "terminal_execute",
-                  query: "",
-                  command: info.args?.command ?? "",
-                })
               } else {
                 setSearching(true)
                 collectedToolCalls.push({
@@ -305,99 +475,6 @@ export function useStream() {
           }
         }
 
-        // If terminal commands were executed (via approval), make a follow-up
-        // streaming request so the model can generate a response based on results
-        if (terminalToolContext && !abortController.signal.aborted) {
-          const followUpAbort = new AbortController()
-          abortRef.current = followUpAbort
-
-          const followUpGenerator = streamChat({
-            thread_id: conversationId,
-            messages: [
-              ...historyMessages,
-              { role: "user" as MessageRole, content },
-            ],
-            new_message: `[Tool results:${terminalToolContext}]\n\n${content}`,
-            provider,
-            model,
-            thinking_mode: thinkingMode,
-            web_search: webSearchMode,
-            terminal_access: terminalMode,
-          }, followUpAbort.signal)
-
-          for await (const event of followUpGenerator) {
-            if (followUpAbort.signal.aborted) break
-
-            if (event.type === "token") {
-              setThinking(false)
-              setSearching(false)
-              setExecuting(false)
-              appendToken(conversationId, assistantMessageId, event.content ?? "")
-            } else if (event.type === "thinking_start") {
-              setThinking(true)
-            } else if (event.type === "tool_start") {
-              setThinking(false)
-              try {
-                const info = JSON.parse(event.content ?? "{}")
-                if (info.name === "terminal_execute") {
-                  setExecuting(true)
-                } else {
-                  setSearching(true)
-                }
-                collectedToolCalls.push({
-                  name: info.name ?? "unknown",
-                  query: info.args?.query ?? "",
-                  command: info.args?.command ?? "",
-                })
-              } catch { /* ignore */ }
-            } else if (event.type === "tool_result") {
-              try {
-                const result = JSON.parse(event.content ?? "{}")
-                const lastTc = collectedToolCalls[collectedToolCalls.length - 1]
-                if (lastTc?.name === "terminal_execute") {
-                  if (result.status === "success") {
-                    lastTc.terminalResult = {
-                      command: result.command,
-                      exit_code: result.exit_code,
-                      stdout: result.stdout,
-                      stderr: result.stderr,
-                      truncated: result.truncated,
-                    } as TerminalResult
-                  } else {
-                    lastTc.error = result.message
-                  }
-                } else if (lastTc) {
-                  if (result.status === "success" && result.results) {
-                    lastTc.results = result.results as SearchResult[]
-                  } else if (result.status === "error") {
-                    lastTc.error = result.message
-                  }
-                }
-              } catch { /* ignore */ }
-              setSearching(false)
-              setExecuting(false)
-              if (collectedToolCalls.length > 0) {
-                setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
-              }
-            } else if (event.type === "image_result") {
-              try {
-                const imgData = JSON.parse(event.content ?? "{}") as ImageResult
-                addImage(conversationId, assistantMessageId, imgData)
-              } catch { /* ignore */ }
-            } else if (event.type === "tool_error") {
-              setSearching(false)
-              setExecuting(false)
-            } else if (event.type === "error") {
-              setThinking(false)
-              setSearching(false)
-              setExecuting(false)
-              appendToken(conversationId, assistantMessageId, `\n\n[Error: ${event.content}]`)
-              break
-            } else if (event.type === "done") {
-              break
-            }
-          }
-        }
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") {
           // Stream was cancelled by user — not an error

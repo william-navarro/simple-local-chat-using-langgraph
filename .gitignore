@@ -29,5 +29,10 @@ bin/data/
 bin/static/
 bin/logs/
 
+# Study / personal notes
+STUDY.md
+STUDY2.md
+STUDY3.md
+
 # Claude
 .claude/

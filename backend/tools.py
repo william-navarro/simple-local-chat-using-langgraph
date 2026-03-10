@@ -68,7 +68,7 @@ ALLOWED_COMMANDS = {
     "select-object", "select-string", "where-object",
     "sort-object", "format-table", "format-list",
     "measure-object", "group-object", "out-string",
-    "convertto-json", "convertfrom-json",
+    "convertto-json", "convertfrom-json", "foreach-object", "Get-FullName"
     # PowerShell aliases that map to read-only cmdlets
     "gci", "gc", "gi", "gl", "gps", "gsv", "gal",
     # Git (read-only)

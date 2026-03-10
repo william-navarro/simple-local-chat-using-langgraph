@@ -86,6 +86,55 @@ export async function executeTerminalCommand(
   return res.json()
 }
 
+export async function* resumeGraph(
+  threadId: string,
+  approved: boolean,
+  result?: Record<string, unknown>,
+  provider?: string,
+  model?: string,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  const response = await fetch(`${BASE_URL}/chat/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ thread_id: threadId, approved, result, provider, model }),
+    signal,
+  })
+
+  if (!response.ok) {
+    throw new Error(`Backend error: ${response.status} ${response.statusText}`)
+  }
+
+  if (!response.body) {
+    throw new Error("No response body")
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        const raw = line.slice(6).trim()
+        if (!raw) continue
+        try {
+          yield JSON.parse(raw) as StreamEvent
+        } catch {
+          // malformed chunk, skip
+        }
+      }
+    }
+  }
+}
+
 export async function fetchProviders(): Promise<ProviderInfo[]> {
   try {
     const res = await fetch(`${BASE_URL}/providers`)

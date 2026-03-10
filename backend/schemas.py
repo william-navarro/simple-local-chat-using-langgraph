@@ -55,6 +55,14 @@ class TerminalExecuteResponse(BaseModel):
     message: str | None = None
 
 
+class ResumeRequest(BaseModel):
+    thread_id: str
+    approved: bool
+    result: dict | None = None
+    provider: str = "lm_studio"
+    model: str = "local-model"
+
+
 class ErrorResponse(BaseModel):
     detail: str
 

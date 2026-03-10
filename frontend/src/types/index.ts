@@ -85,6 +85,7 @@ export interface StreamEvent {
     | "tool_result"
     | "tool_error"
     | "terminal_pending"
+    | "terminal_interrupt"
     | "image_result"
     | "compressing"
   content?: string

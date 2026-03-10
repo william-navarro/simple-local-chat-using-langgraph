@@ -17,10 +17,11 @@ from pathlib import Path
 from schemas import (
     ChatRequest, TitleRequest, TitleResponse, ErrorResponse,
     TerminalExecuteRequest, TerminalExecuteResponse,
+    ResumeRequest,
     GlobalSettings, ApiKeysUpdate, ApiKeysResponse,
     ProviderUrlsUpdate, ProviderUrlsResponse,
 )
-from graph import stream_graph_response, generate_title_from_message
+from graph import stream_graph_response, resume_graph_response, generate_title_from_message, get_compiled_graph, close_checkpointer
 from providers import check_provider_status, fetch_provider_models, list_all_providers
 from model_cache import refresh_all_cloud_models
 from settings_store import get_settings, update_settings
@@ -43,10 +44,19 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
-    """Refresh cloud model lists on backend startup."""
+    """Initialize checkpointer and refresh cloud model lists on backend startup."""
+    await get_compiled_graph()
+    logging.info("[STARTUP] LangGraph checkpointer initialized")
     results = await refresh_all_cloud_models()
     for provider, models in results.items():
         logging.info(f"[STARTUP] {provider}: {len(models)} models cached")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Close checkpointer connection on shutdown."""
+    await close_checkpointer()
+    logging.info("[SHUTDOWN] Checkpointer closed")
 
 
 @app.get("/health")
@@ -133,6 +143,31 @@ async def chat_stream(request: ChatRequest):
                 max_history_tokens=request.max_history_tokens,
                 system_prompt=request.system_prompt,
                 tool_call_max_iterations=request.tool_call_max_iterations,
+            ):
+                yield chunk
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/chat/resume")
+async def chat_resume(request: ResumeRequest):
+    async def event_generator():
+        try:
+            async for chunk in resume_graph_response(
+                thread_id=request.thread_id,
+                approved=request.approved,
+                result=request.result,
+                provider=request.provider,
+                model=request.model,
             ):
                 yield chunk
         except Exception as e:
