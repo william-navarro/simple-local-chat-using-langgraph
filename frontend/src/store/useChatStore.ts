@@ -1,7 +1,39 @@
 import { create } from "zustand"
-import { persist } from "zustand/middleware"
+import { persist, type PersistStorage, type StorageValue } from "zustand/middleware"
 import { v4 as uuidv4 } from "uuid"
 import type { Conversation, Message, MessageType, ToolCallInfo, ImageResult, LLMProvider, GlobalSettings, ConversationSettings } from "../types"
+
+/** Wraps localStorage with a throttled setItem to avoid writes on every token. */
+function createThrottledStorage<T>(delay = 1000): PersistStorage<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let pending: StorageValue<T> | null = null
+  let pendingKey: string | null = null
+
+  return {
+    getItem: (name) => {
+      const raw = localStorage.getItem(name)
+      if (!raw) return null
+      return JSON.parse(raw) as StorageValue<T>
+    },
+    setItem: (name, value) => {
+      pendingKey = name
+      pending = value
+      if (!timer) {
+        timer = setTimeout(() => {
+          timer = null
+          if (pending !== null && pendingKey !== null) {
+            localStorage.setItem(pendingKey, JSON.stringify(pending))
+            pending = null
+          }
+        }, delay)
+      }
+    },
+    removeItem: (name) => localStorage.removeItem(name),
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const throttledStorage = createThrottledStorage<any>(1000)
 
 export interface PendingTerminalCommand {
   command: string
@@ -257,6 +289,7 @@ export const useChatStore = create<ChatStore>()(
     }),
     {
       name: "langgraph-chat-storage",
+      storage: throttledStorage,
       partialize: (state) => ({
         conversations: state.conversations,
         activeConversationId: state.activeConversationId,

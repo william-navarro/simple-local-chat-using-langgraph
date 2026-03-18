@@ -5,6 +5,35 @@ import type { MessageRole, ToolCallInfo, SearchResult, TerminalResult, ImageResu
 
 export type TerminalApprovalResult = "approve" | "approve_always" | "deny"
 
+/** Batches rapid appendToken calls into ~30fps flushes to avoid per-token re-renders. */
+function createTokenBuffer(appendToken: (cid: string, mid: string, t: string) => void) {
+  let buffer = ""
+  let cid = ""
+  let mid = ""
+  let raf = 0
+
+  function flush() {
+    raf = 0
+    if (buffer) {
+      appendToken(cid, mid, buffer)
+      buffer = ""
+    }
+  }
+
+  return {
+    push(conversationId: string, messageId: string, token: string) {
+      cid = conversationId
+      mid = messageId
+      buffer += token
+      if (!raf) raf = requestAnimationFrame(flush)
+    },
+    flush() {
+      if (raf) { cancelAnimationFrame(raf); raf = 0 }
+      flush()
+    },
+  }
+}
+
 export function useStream() {
   const {
     addMessage,
@@ -27,6 +56,8 @@ export function useStream() {
     webSearchMode,
     terminalMode,
   } = useChatStore()
+
+  const tokenBufferRef = useRef(createTokenBuffer(appendToken))
 
   // Ref to hold the resolve function for the terminal approval promise
   const approvalResolveRef = useRef<((result: TerminalApprovalResult) => void) | null>(null)
@@ -102,10 +133,42 @@ export function useStream() {
           .catch(() => { /* title generation is non-critical */ })
       }
 
-      const historyMessages = conversation.messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      }))
+      const historyMessages = conversation.messages.map((m) => {
+        // Inject a concise tool-call summary into assistant messages so
+        // the LLM remembers what it did. Uses plain prose (not brackets
+        // or code) to avoid the model mimicking the format as output.
+        let content = m.content
+        if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+          const parts = m.toolCalls.map((tc) => {
+            if (tc.name === "terminal_execute") {
+              const cmd = tc.command ?? ""
+              const shell = tc.shell ?? "cmd"
+              if (tc.terminalResult) {
+                const r = tc.terminalResult
+                const ok = r.exit_code === 0 ? "succeeded" : `failed (exit ${r.exit_code})`
+                const out = r.stdout ? r.stdout.slice(0, 500) : ""
+                return `I ran "${cmd}" (${shell}) — ${ok}.${out ? ` Output: ${out}` : ""}`
+              }
+              if (tc.error) return `I tried "${cmd}" (${shell}) — ${tc.error}.`
+              return `I ran "${cmd}" (${shell}).`
+            }
+            if (tc.name === "web_search") {
+              const q = tc.query ?? ""
+              if (tc.results && tc.results.length > 0) {
+                return `I searched "${q}" and found ${tc.results.length} results.`
+              }
+              if (tc.error) return `I searched "${q}" — ${tc.error}.`
+              return `I searched "${q}".`
+            }
+            if (tc.name === "send_image") {
+              return "I sent an image to the user."
+            }
+            return ""
+          }).filter(Boolean).join(" ")
+          content = `${parts}${content ? `\n${content}` : ""}`
+        }
+        return { role: m.role, content }
+      })
 
       // Collect tool calls to set on the message after streaming
       const collectedToolCalls: ToolCallInfo[] = []
@@ -319,7 +382,7 @@ export function useStream() {
                     setThinking(false)
                     setSearching(false)
                     setExecuting(false)
-                    appendToken(conversationId, assistantMessageId, resumeEvent.content ?? "")
+                    tokenBufferRef.current.push(conversationId, assistantMessageId, resumeEvent.content ?? "")
                   } else if (resumeEvent.type === "thinking_start") {
                     setThinking(true)
                   } else if (resumeEvent.type === "tool_start") {
@@ -383,6 +446,7 @@ export function useStream() {
                     setThinking(false)
                     setSearching(false)
                     setExecuting(false)
+                    tokenBufferRef.current.flush()
                     appendToken(conversationId, assistantMessageId, `\n\n[Error: ${resumeEvent.content}]`)
                     break
                   } else if (resumeEvent.type === "done") {
@@ -455,7 +519,7 @@ export function useStream() {
             setSearching(false)
             setExecuting(false)
             setCompressing(false)
-            appendToken(conversationId, assistantMessageId, event.content ?? "")
+            tokenBufferRef.current.push(conversationId, assistantMessageId, event.content ?? "")
           } else if (event.type === "message_type") {
             setCompressing(false)
             setMessageType(
@@ -468,6 +532,7 @@ export function useStream() {
             setSearching(false)
             setExecuting(false)
             setCompressing(false)
+            tokenBufferRef.current.flush()
             appendToken(conversationId, assistantMessageId, `\n\n[Error: ${event.content}]`)
             break
           } else if (event.type === "done") {
@@ -476,12 +541,14 @@ export function useStream() {
         }
 
       } catch (err) {
+        tokenBufferRef.current.flush()
         if (err instanceof DOMException && err.name === "AbortError") {
           // Stream was cancelled by user — not an error
         } else {
           appendToken(conversationId, assistantMessageId, `\n\n[Backend connection error]`)
         }
       } finally {
+        tokenBufferRef.current.flush()
         abortRef.current = null
         setStreaming(false)
         setThinking(false)

@@ -167,8 +167,9 @@ def build_system_prompt(
             "These are separate API tools — call them via tool_calls, NOT as shell commands. "
             "ALWAYS call the tool — never simulate or fabricate output. "
             "You can call multiple tools at once (parallel tool calls). "
-            "IMPORTANT: If a task requires chaining (e.g. list files then show one), "
-            "do the first step now and tell the user to ask for the next step. "
+            "You can chain tool calls across multiple rounds (e.g. list files, then send one). "
+            "When you call send_image, the image is displayed automatically to the user — "
+            "do NOT write markdown image links like ![alt](path) in your text response. "
             "Retry on errors before explaining them. Avoid recursive scans on root dirs."
         )
         if os_name == "Windows":
@@ -210,8 +211,13 @@ def build_user_content(
     ]
 
 
-def build_llm_messages(state: dict, conf: dict) -> list[AnyMessage]:
-    """Build the full message list for the LLM call from state + config."""
+def build_llm_messages(state: dict, conf: dict, *, include_human: bool = True) -> list[AnyMessage]:
+    """Build the full message list for the LLM call from state + config.
+
+    Args:
+        include_human: If True, appends a new HumanMessage at the end.
+            Set to False on iteration 2+ when HumanMessage is already in state.
+    """
     system_prompt = build_system_prompt(
         state.get("message_type", "simple"),
         conf.get("thinking_mode", False),
@@ -219,15 +225,18 @@ def build_llm_messages(state: dict, conf: dict) -> list[AnyMessage]:
         conf.get("terminal_access", False),
         conf.get("custom_system_prompt", ""),
     )
-    user_content = build_user_content(
-        state["new_message"],
-        state.get("image_base64"),
-        state.get("image_media_type"),
-    )
 
     msgs: list[AnyMessage] = [SystemMessage(content=system_prompt)]
-    msgs.extend(state["messages"])
-    msgs.append(HumanMessage(content=user_content))
+    msgs.extend(_sanitize_tool_messages(state["messages"]))
+
+    if include_human:
+        user_content = build_user_content(
+            state["new_message"],
+            state.get("image_base64"),
+            state.get("image_media_type"),
+        )
+        msgs.append(HumanMessage(content=user_content))
+
     return msgs
 
 
@@ -297,13 +306,16 @@ _SIMULATED_TOOL_PATTERN = re.compile(
 async def node_call_model(state: GraphState, config: RunnableConfig) -> GraphState:
     """Call the LLM, optionally with tools bound for tool detection.
 
-    Persists the HumanMessage in state so that downstream nodes
-    (like final_response) have the correct message ordering.
+    On iteration 0 (first call): persists HumanMessage + AIMessage in state.
+    On iteration 1+ (after tool results): only persists AIMessage (HumanMessage already in state).
     """
     conf = config["configurable"]
-    log.info(f"[CALL_MODEL] provider={conf.get('provider')}, model={conf.get('model')}")
+    iteration = state.get("tool_call_iterations", 0)
+    max_iter = conf.get("max_iterations_limit", 3)
+    log.info(f"[CALL_MODEL] iteration={iteration}/{max_iter}, provider={conf.get('provider')}, model={conf.get('model')}")
 
-    msgs = build_llm_messages(state, conf)
+    is_first_call = iteration == 0
+    msgs = build_llm_messages(state, conf, include_human=is_first_call)
     llm = conf["llm"]
 
     enabled_tools = get_enabled_tools(conf)
@@ -327,7 +339,7 @@ async def node_call_model(state: GraphState, config: RunnableConfig) -> GraphSta
         except Exception as e:
             log.info(f"[CALL_MODEL] Tool binding failed, falling back without tools: {e}")
             fallback_conf = {**conf, "web_search": False, "terminal_access": False}
-            fallback_msgs = build_llm_messages(state, fallback_conf)
+            fallback_msgs = build_llm_messages(state, fallback_conf, include_human=is_first_call)
             response = await llm.ainvoke(fallback_msgs)
     else:
         response = await llm.ainvoke(msgs)
@@ -348,21 +360,27 @@ async def node_call_model(state: GraphState, config: RunnableConfig) -> GraphSta
     ):
         log.info("[CALL_MODEL] Detected simulated tool calls in text, retrying without tools")
         fallback_conf = {**conf, "web_search": False, "terminal_access": False}
-        fallback_msgs = build_llm_messages(state, fallback_conf)
+        fallback_msgs = build_llm_messages(state, fallback_conf, include_human=is_first_call)
         response = await llm.ainvoke(fallback_msgs)
 
-    # Persist the HumanMessage so that final_response sees the correct order:
-    # [...history, HumanMessage, AIMessage(tool_calls?), ...]
-    user_content = build_user_content(
-        state["new_message"],
-        state.get("image_base64"),
-        state.get("image_media_type"),
-    )
-    human_msg = HumanMessage(content=user_content)
+    # On first call, persist HumanMessage so downstream nodes see correct order:
+    # [...history, HumanMessage, AIMessage(tool_calls?), ToolMessage(s), ...]
+    if is_first_call:
+        user_content = build_user_content(
+            state["new_message"],
+            state.get("image_base64"),
+            state.get("image_media_type"),
+        )
+        human_msg = HumanMessage(content=user_content)
+        new_messages = state["messages"] + [human_msg, response]
+    else:
+        # Iteration 2+: HumanMessage already in state from first call
+        new_messages = state["messages"] + [response]
 
     return {
         **state,
-        "messages": state["messages"] + [human_msg, response],
+        "messages": new_messages,
+        "tool_call_iterations": iteration + 1,
     }
 
 
@@ -491,9 +509,34 @@ async def node_final_response(state: GraphState, config: RunnableConfig) -> Grap
 
     Calls the LLM WITHOUT tools bound, so it must produce a text
     response based on the tool results already in state["messages"].
+
+    If the last message is an empty/think-only AIMessage (from call_model
+    that decided not to use tools), it is dropped so the LLM sees a clean
+    context ending with ToolMessage results.
     """
     conf = config["configurable"]
     log.info("[FINAL_RESPONSE] Generating response after tool execution")
+
+    state_msgs = list(state["messages"])
+
+    # Drop trailing AIMessage if it has no useful content (think-only or empty).
+    # This happens when call_model iteration 2+ produced <think> but no text/tools,
+    # and route_after_model sent us here instead of END.
+    if state_msgs and isinstance(state_msgs[-1], AIMessage):
+        last_ai = state_msgs[-1]
+        has_tool_calls = bool(getattr(last_ai, "tool_calls", None))
+        raw = last_ai.content or ""
+        if isinstance(raw, list):
+            text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in raw
+            )
+        else:
+            text = raw
+        # Strip <think> blocks to check if there's real content
+        stripped = re.sub(r"<think[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+        if not has_tool_calls and not stripped:
+            log.info("[FINAL_RESPONSE] Dropping empty/think-only AIMessage from context")
+            state_msgs = state_msgs[:-1]
 
     system_prompt = build_system_prompt(
         state.get("message_type", "simple"),
@@ -503,9 +546,8 @@ async def node_final_response(state: GraphState, config: RunnableConfig) -> Grap
         conf.get("custom_system_prompt", ""),
     )
 
-    # state["messages"] has: [...history, HumanMessage, AIMessage(tool_calls), ToolMessage(s)]
     # Sanitize to remove large base64 payloads from ToolMessages
-    clean_msgs = _sanitize_tool_messages(state["messages"])
+    clean_msgs = _sanitize_tool_messages(state_msgs)
     msgs: list[AnyMessage] = [SystemMessage(content=system_prompt)]
     msgs.extend(clean_msgs)
 
@@ -583,7 +625,13 @@ def route_after_check(state: GraphState, config: RunnableConfig) -> str:
 
 
 def route_after_model(state: GraphState, config: RunnableConfig) -> str:
-    """Route after LLM call: if tool_calls present, go to tool_node; otherwise END."""
+    """Route after LLM call: tool_calls → tool_node, else END or final_response.
+
+    On iteration 0 (first call) with no tool_calls → END (normal text response).
+    On iteration 1+ (after tool execution) with no tool_calls → final_response,
+    because the LLM may produce only <think> content or an empty response when
+    it has tools bound. final_response calls LLM without tools to force clean text.
+    """
     conf = config["configurable"]
     last_msg = state["messages"][-1]
     if (
@@ -592,7 +640,30 @@ def route_after_model(state: GraphState, config: RunnableConfig) -> str:
         and last_msg.tool_calls
     ):
         return "tool_node"
+
+    iteration = state.get("tool_call_iterations", 0)
+    if iteration > 1:
+        # After tool execution: LLM decided not to call more tools but may have
+        # produced only <think> content. Route to final_response for a clean answer.
+        log.info(f"[ROUTE] iteration={iteration}, no tool_calls → final_response")
+        return "final_response"
+
     return END
+
+
+def route_after_tool(state: GraphState, config: RunnableConfig) -> str:
+    """Route after tool execution: loop back to call_model or go to final_response.
+
+    Loops back if under the iteration limit, goes to final_response otherwise.
+    """
+    conf = config["configurable"]
+    iterations = state.get("tool_call_iterations", 0)
+    max_iter = conf.get("max_iterations_limit", 3)
+    if iterations >= max_iter:
+        log.info(f"[ROUTE] Iteration limit reached ({iterations}/{max_iter}) → final_response")
+        return "final_response"
+    log.info(f"[ROUTE] Iteration {iterations}/{max_iter} → call_model (next round)")
+    return "call_model"
 
 
 # --- Graph assembly ---
@@ -630,13 +701,17 @@ def _build_graph(checkpointer):
     )
     graph.add_edge("compress_history", "call_model")
 
-    # Single-round tool pattern (NO loop back to call_model)
+    # Multi-round tool pattern: call_model ↔ tool_node (max N iterations) → final_response
     graph.add_conditional_edges(
         "call_model",
         route_after_model,
-        {"tool_node": "tool_node", END: END},
+        {"tool_node": "tool_node", "final_response": "final_response", END: END},
     )
-    graph.add_edge("tool_node", "final_response")
+    graph.add_conditional_edges(
+        "tool_node",
+        route_after_tool,
+        {"call_model": "call_model", "final_response": "final_response"},
+    )
     graph.add_edge("final_response", END)
 
     return graph.compile(checkpointer=checkpointer)

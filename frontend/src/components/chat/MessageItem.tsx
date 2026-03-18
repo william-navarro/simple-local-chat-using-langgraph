@@ -1,5 +1,5 @@
 import { Brain, Globe, Terminal, Tag, Bot, User, Copy, Check, X } from "lucide-react"
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, memo, useMemo } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter"
@@ -88,109 +88,112 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
   )
 }
 
-function MarkdownContent({ content }: { content: string }) {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const markdownComponents: Record<string, any> = {
+  code({ className, children, ...props }: { className?: string; children?: React.ReactNode; [key: string]: unknown }) {
+    const match = /language-(\w+)/.exec(className || "")
+    const codeString = String(children).replace(/\n$/, "")
+    const isBlock = codeString.includes("\n") || (className ?? "").includes("language-")
+
+    if (isBlock) {
+      return <CodeBlock language={match?.[1] ?? ""} code={codeString} />
+    }
+
+    return (
+      <code
+        className="px-1 py-0.5 rounded bg-zinc-700 text-violet-300 text-xs font-mono break-all"
+        {...props}
+      >
+        {children}
+      </code>
+    )
+  },
+  p({ children }: { children?: React.ReactNode }) {
+    return <p className="mb-2 last:mb-0 leading-relaxed break-words">{children}</p>
+  },
+  strong({ children }: { children?: React.ReactNode }) {
+    return <strong className="font-semibold text-zinc-100">{children}</strong>
+  },
+  em({ children }: { children?: React.ReactNode }) {
+    return <em className="italic text-zinc-300">{children}</em>
+  },
+  ul({ children }: { children?: React.ReactNode }) {
+    return <ul className="mb-2 ml-4 space-y-0.5 list-disc marker:text-zinc-500">{children}</ul>
+  },
+  ol({ children }: { children?: React.ReactNode }) {
+    return <ol className="mb-2 ml-4 space-y-0.5 list-decimal marker:text-zinc-500">{children}</ol>
+  },
+  li({ children }: { children?: React.ReactNode }) {
+    return <li className="leading-relaxed break-words">{children}</li>
+  },
+  h1({ children }: { children?: React.ReactNode }) {
+    return <h1 className="text-base font-bold text-zinc-100 mb-2 mt-3 first:mt-0">{children}</h1>
+  },
+  h2({ children }: { children?: React.ReactNode }) {
+    return <h2 className="text-sm font-bold text-zinc-100 mb-2 mt-3 first:mt-0">{children}</h2>
+  },
+  h3({ children }: { children?: React.ReactNode }) {
+    return <h3 className="text-sm font-semibold text-zinc-200 mb-1.5 mt-2 first:mt-0">{children}</h3>
+  },
+  blockquote({ children }: { children?: React.ReactNode }) {
+    return (
+      <blockquote className="border-l-2 border-zinc-600 pl-3 my-2 text-zinc-400 italic break-words">
+        {children}
+      </blockquote>
+    )
+  },
+  a({ href, children }: { href?: string; children?: React.ReactNode }) {
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-violet-400 underline hover:text-violet-300 transition-colors break-all"
+      >
+        {children}
+      </a>
+    )
+  },
+  hr() {
+    return <hr className="my-3 border-zinc-700" />
+  },
+  table({ children }: { children?: React.ReactNode }) {
+    return (
+      <div className="my-2 overflow-x-auto max-w-full">
+        <table className="text-xs border-collapse border border-zinc-700">
+          {children}
+        </table>
+      </div>
+    )
+  },
+  th({ children }: { children?: React.ReactNode }) {
+    return (
+      <th className="px-3 py-1.5 text-left font-semibold text-zinc-200 bg-zinc-800 border border-zinc-700 whitespace-nowrap">
+        {children}
+      </th>
+    )
+  },
+  td({ children }: { children?: React.ReactNode }) {
+    return (
+      <td className="px-3 py-1.5 text-zinc-300 border border-zinc-700">
+        {children}
+      </td>
+    )
+  },
+}
+
+const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
   return (
     <div className="min-w-0 overflow-hidden">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{
-          code({ className, children, ...props }) {
-            const match = /language-(\w+)/.exec(className || "")
-            const codeString = String(children).replace(/\n$/, "")
-            const isBlock = codeString.includes("\n") || (className ?? "").includes("language-")
-
-            if (isBlock) {
-              return <CodeBlock language={match?.[1] ?? ""} code={codeString} />
-            }
-
-            return (
-              <code
-                className="px-1 py-0.5 rounded bg-zinc-700 text-violet-300 text-xs font-mono break-all"
-                {...props}
-              >
-                {children}
-              </code>
-            )
-          },
-          p({ children }) {
-            return <p className="mb-2 last:mb-0 leading-relaxed break-words">{children}</p>
-          },
-          strong({ children }) {
-            return <strong className="font-semibold text-zinc-100">{children}</strong>
-          },
-          em({ children }) {
-            return <em className="italic text-zinc-300">{children}</em>
-          },
-          ul({ children }) {
-            return <ul className="mb-2 ml-4 space-y-0.5 list-disc marker:text-zinc-500">{children}</ul>
-          },
-          ol({ children }) {
-            return <ol className="mb-2 ml-4 space-y-0.5 list-decimal marker:text-zinc-500">{children}</ol>
-          },
-          li({ children }) {
-            return <li className="leading-relaxed break-words">{children}</li>
-          },
-          h1({ children }) {
-            return <h1 className="text-base font-bold text-zinc-100 mb-2 mt-3 first:mt-0">{children}</h1>
-          },
-          h2({ children }) {
-            return <h2 className="text-sm font-bold text-zinc-100 mb-2 mt-3 first:mt-0">{children}</h2>
-          },
-          h3({ children }) {
-            return <h3 className="text-sm font-semibold text-zinc-200 mb-1.5 mt-2 first:mt-0">{children}</h3>
-          },
-          blockquote({ children }) {
-            return (
-              <blockquote className="border-l-2 border-zinc-600 pl-3 my-2 text-zinc-400 italic break-words">
-                {children}
-              </blockquote>
-            )
-          },
-          a({ href, children }) {
-            return (
-              <a
-                href={href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-violet-400 underline hover:text-violet-300 transition-colors break-all"
-              >
-                {children}
-              </a>
-            )
-          },
-          hr() {
-            return <hr className="my-3 border-zinc-700" />
-          },
-          table({ children }) {
-            return (
-              <div className="my-2 overflow-x-auto max-w-full">
-                <table className="text-xs border-collapse border border-zinc-700">
-                  {children}
-                </table>
-              </div>
-            )
-          },
-          th({ children }) {
-            return (
-              <th className="px-3 py-1.5 text-left font-semibold text-zinc-200 bg-zinc-800 border border-zinc-700 whitespace-nowrap">
-                {children}
-              </th>
-            )
-          },
-          td({ children }) {
-            return (
-              <td className="px-3 py-1.5 text-zinc-300 border border-zinc-700">
-                {children}
-              </td>
-            )
-          },
-        }}
+        components={markdownComponents}
       >
         {content}
       </ReactMarkdown>
     </div>
   )
-}
+})
 
 function ThinkingBlock({ content, isStreaming }: { content: string; isStreaming: boolean }) {
   return (
@@ -419,9 +422,18 @@ function parseContent(raw: string): ContentPart[] {
   return parts
 }
 
-export function MessageItem({ message, isStreaming }: MessageItemProps) {
+export const MessageItem = memo(function MessageItem({ message, isStreaming }: MessageItemProps) {
   const isUser = message.role === "user"
-  const parts = isUser ? null : parseContent(message.content)
+  const parts = useMemo(() => {
+    if (isUser) return null
+    let content = message.content
+    // Strip markdown image references (![alt](path)) when actual images are
+    // already displayed via ImageBlock — avoids broken local-path <img> tags.
+    if (message.images && message.images.length > 0) {
+      content = content.replace(/!\[[^\]]*\]\([^)]*\)\s*/g, "")
+    }
+    return parseContent(content)
+  }, [isUser, message.content, message.images])
 
   return (
     <div className={`flex gap-3 ${isUser ? "flex-row-reverse" : "flex-row"} min-w-0`}>
@@ -503,4 +515,4 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
       </div>
     </div>
   )
-}
+})
