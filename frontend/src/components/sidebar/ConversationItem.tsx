@@ -10,7 +10,7 @@ interface ConversationItemProps {
 }
 
 export function ConversationItem({ conversation, isActive }: ConversationItemProps) {
-  const { setActiveConversation, deleteConversation } = useChatStore()
+  const { setActiveConversation, deleteConversation, loadConversation } = useChatStore()
   const [showDelete, setShowDelete] = useState(false)
 
   const handleDelete = (e: React.MouseEvent) => {
@@ -31,7 +31,7 @@ export function ConversationItem({ conversation, isActive }: ConversationItemPro
   return (
     <>
       <div
-        onClick={() => setActiveConversation(conversation.id)}
+        onClick={() => { setActiveConversation(conversation.id); loadConversation(conversation.id) }}
         className={`
           group flex items-center gap-3 px-3 py-2.5 rounded-lg cursor-pointer
           transition-colors duration-150 select-none

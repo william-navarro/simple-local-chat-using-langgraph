@@ -133,43 +133,6 @@ export function useStream() {
           .catch(() => { /* title generation is non-critical */ })
       }
 
-      const historyMessages = conversation.messages.map((m) => {
-        // Inject a concise tool-call summary into assistant messages so
-        // the LLM remembers what it did. Uses plain prose (not brackets
-        // or code) to avoid the model mimicking the format as output.
-        let content = m.content
-        if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
-          const parts = m.toolCalls.map((tc) => {
-            if (tc.name === "terminal_execute") {
-              const cmd = tc.command ?? ""
-              const shell = tc.shell ?? "cmd"
-              if (tc.terminalResult) {
-                const r = tc.terminalResult
-                const ok = r.exit_code === 0 ? "succeeded" : `failed (exit ${r.exit_code})`
-                const out = r.stdout ? r.stdout.slice(0, 500) : ""
-                return `I ran "${cmd}" (${shell}) — ${ok}.${out ? ` Output: ${out}` : ""}`
-              }
-              if (tc.error) return `I tried "${cmd}" (${shell}) — ${tc.error}.`
-              return `I ran "${cmd}" (${shell}).`
-            }
-            if (tc.name === "web_search") {
-              const q = tc.query ?? ""
-              if (tc.results && tc.results.length > 0) {
-                return `I searched "${q}" and found ${tc.results.length} results.`
-              }
-              if (tc.error) return `I searched "${q}" — ${tc.error}.`
-              return `I searched "${q}".`
-            }
-            if (tc.name === "send_image") {
-              return "I sent an image to the user."
-            }
-            return ""
-          }).filter(Boolean).join(" ")
-          content = `${parts}${content ? `\n${content}` : ""}`
-        }
-        return { role: m.role, content }
-      })
-
       // Collect tool calls to set on the message after streaming
       const collectedToolCalls: ToolCallInfo[] = []
 
@@ -177,8 +140,7 @@ export function useStream() {
         const provider = selectedProvider || "lm_studio"
         const effectiveSettings = useChatStore.getState().getEffectiveSettings()
         const generator = streamChat({
-          thread_id: conversationId,
-          messages: historyMessages,
+          conversation_id: conversationId,
           new_message: content,
           image_base64: imageBase64,
           image_media_type: imageMediaType,

@@ -4,7 +4,7 @@ import logging
 import platform
 import re
 import uuid
-from typing import AsyncIterator, TypedDict, Literal
+from typing import Annotated, AsyncIterator, TypedDict, Literal
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
@@ -21,6 +21,7 @@ from langchain_core.messages import (
 )
 from pathlib import Path
 from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages, RemoveMessage
 from langgraph.types import interrupt, Command
 
 from config import settings
@@ -31,7 +32,7 @@ from tools import ALL_TOOLS, web_search, terminal_execute, send_image
 # --- State (mutable execution data only) ---
 
 class GraphState(TypedDict):
-    messages: list[AnyMessage]
+    messages: Annotated[list[AnyMessage], add_messages]
     new_message: str
     image_base64: str | None
     image_media_type: str | None
@@ -258,17 +259,17 @@ def node_pre_process(state: GraphState) -> GraphState:
     else:
         message_type = "simple"
 
-    return {**state, "message_type": message_type}
+    return {"message_type": message_type}
 
 
-def node_check_history(state: GraphState, config: RunnableConfig) -> GraphState:
+def node_check_history(state: GraphState, config: RunnableConfig) -> dict:
     conf = config["configurable"]
     max_hist = conf.get("max_history_tokens", settings.max_history_tokens)
     compressed = estimate_tokens(state["messages"]) > max_hist
-    return {**state, "history_compressed": compressed}
+    return {"history_compressed": compressed}
 
 
-async def node_compress_history(state: GraphState, config: RunnableConfig) -> GraphState:
+async def node_compress_history(state: GraphState, config: RunnableConfig) -> dict:
     conf = config["configurable"]
     history_text = "\n".join(
         f"{m.type.upper()}: {m.content}"
@@ -286,12 +287,15 @@ async def node_compress_history(state: GraphState, config: RunnableConfig) -> Gr
 
     summary = response.content or ""
 
+    # With add_messages reducer, we must explicitly remove old messages
+    # then add the compressed ones. RemoveMessage tells the reducer to delete by id.
+    removals = [RemoveMessage(id=m.id) for m in state["messages"]]
     compressed: list[AnyMessage] = [
         HumanMessage(content=f"[Previous conversation summary: {summary}]"),
         AIMessage(content="Understood. I have the context from our previous conversation."),
     ]
 
-    return {**state, "messages": compressed, "history_compressed": True}
+    return {"messages": removals + compressed, "history_compressed": True}
 
 
 _SIMULATED_TOOL_PATTERN = re.compile(
@@ -363,8 +367,7 @@ async def node_call_model(state: GraphState, config: RunnableConfig) -> GraphSta
         fallback_msgs = build_llm_messages(state, fallback_conf, include_human=is_first_call)
         response = await llm.ainvoke(fallback_msgs)
 
-    # On first call, persist HumanMessage so downstream nodes see correct order:
-    # [...history, HumanMessage, AIMessage(tool_calls?), ToolMessage(s), ...]
+    # With add_messages reducer, return only NEW messages (reducer appends)
     if is_first_call:
         user_content = build_user_content(
             state["new_message"],
@@ -372,13 +375,11 @@ async def node_call_model(state: GraphState, config: RunnableConfig) -> GraphSta
             state.get("image_media_type"),
         )
         human_msg = HumanMessage(content=user_content)
-        new_messages = state["messages"] + [human_msg, response]
+        new_messages = [human_msg, response]
     else:
-        # Iteration 2+: HumanMessage already in state from first call
-        new_messages = state["messages"] + [response]
+        new_messages = [response]
 
     return {
-        **state,
         "messages": new_messages,
         "tool_call_iterations": iteration + 1,
     }
@@ -387,11 +388,14 @@ async def node_call_model(state: GraphState, config: RunnableConfig) -> GraphSta
 async def node_tool_executor(state: GraphState) -> GraphState:
     """Execute tool calls from the last AIMessage.
 
-    Terminal commands use `interrupt()` to pause the graph and wait for
-    user approval. The frontend receives the interrupt, shows an approval
-    dialog, and resumes the graph via `Command(resume=...)`.
+    Structured in 3 phases to avoid re-execution bugs with LangGraph's
+    interrupt() mechanism (which re-runs the entire node on resume):
+      1. Collect all interrupt() approvals FIRST (no side effects)
+      2. Execute non-terminal tools in parallel
+      3. Process approved terminal commands
 
-    Non-terminal tools are executed in parallel via asyncio.gather().
+    This ensures parallel tools (web_search, send_image) run only once,
+    even when the node is re-executed after an interrupt resume.
     """
     last_msg = state["messages"][-1]
     tool_messages: list[ToolMessage] = []
@@ -399,7 +403,6 @@ async def node_tool_executor(state: GraphState) -> GraphState:
 
     tools_by_name = {t.name: t for t in ALL_TOOLS}
 
-    # Separate terminal (needs approval) from other tools (can run in parallel)
     terminal_calls = []
     parallel_calls = []
     for tc in last_msg.tool_calls:
@@ -408,14 +411,25 @@ async def node_tool_executor(state: GraphState) -> GraphState:
         else:
             parallel_calls.append(tc)
 
-    # Execute non-terminal tools in parallel
+    # --- Phase 1: Collect ALL interrupt approvals (no side effects) ---
+    terminal_approvals: list[tuple[dict, dict]] = []
+    for tc in terminal_calls:
+        approval = interrupt({
+            "tool_call_id": tc["id"],
+            "command": tc["args"].get("command", ""),
+            "working_directory": tc["args"].get("working_directory", "."),
+            "shell": tc["args"].get("shell", "cmd"),
+        })
+        terminal_approvals.append((tc, approval))
+
+    # --- Phase 2: Execute non-terminal tools in parallel ---
     async def _exec_tool(tc: dict) -> tuple[dict, str]:
         tool_fn = tools_by_name.get(tc["name"])
         if not tool_fn:
             return tc, json.dumps({"status": "error", "message": f"Unknown tool: {tc['name']}"})
         try:
             result = await asyncio.to_thread(tool_fn.invoke, tc["args"])
-            return tc, str(result)
+            return tc, _truncate_tool_result(str(result))
         except Exception as e:
             return tc, json.dumps({"status": "error", "message": f"Tool error: {e}"})
 
@@ -431,30 +445,18 @@ async def node_tool_executor(state: GraphState) -> GraphState:
                 "result": result,
             })
 
-    # Handle terminal calls — interrupt for user approval
-    for tc in terminal_calls:
-        command = tc["args"].get("command", "")
-        working_directory = tc["args"].get("working_directory", ".")
-        shell = tc["args"].get("shell", "cmd")
-
-        # Pause graph execution until user approves/denies
-        approval = interrupt({
-            "tool_call_id": tc["id"],
-            "command": command,
-            "working_directory": working_directory,
-            "shell": shell,
-        })
-
+    # --- Phase 3: Execute approved terminal commands ---
+    for tc, approval in terminal_approvals:
         if approval.get("approved"):
-            # User approved — execute the command
             result_data = approval.get("result")
             if result_data:
-                result = json.dumps(result_data)
+                result = _truncate_tool_result(json.dumps(result_data))
             else:
-                # Fallback: execute here if result not provided
                 tool_fn = tools_by_name.get("terminal_execute")
                 try:
-                    result = str(await asyncio.to_thread(tool_fn.invoke, tc["args"]))
+                    result = _truncate_tool_result(
+                        str(await asyncio.to_thread(tool_fn.invoke, tc["args"]))
+                    )
                 except Exception as e:
                     result = json.dumps({"status": "error", "message": f"Tool error: {e}"})
         else:
@@ -470,8 +472,7 @@ async def node_tool_executor(state: GraphState) -> GraphState:
         })
 
     return {
-        **state,
-        "messages": state["messages"] + tool_messages,
+        "messages": tool_messages,
         "tool_calls_log": state.get("tool_calls_log", []) + log_entries,
     }
 
@@ -554,10 +555,7 @@ async def node_final_response(state: GraphState, config: RunnableConfig) -> Grap
     llm = conf["llm"]
     response = await llm.ainvoke(msgs)  # NO bind_tools — forces text response
 
-    return {
-        **state,
-        "messages": state["messages"] + [response],
-    }
+    return {"messages": [response]}
 
 
 # --- Title generation ---
@@ -934,8 +932,7 @@ async def _stream_graph_messages(
 
 
 async def stream_graph_response(
-    thread_id: str,
-    messages: list[dict],
+    conversation_id: str,
     new_message: str,
     image_base64: str | None,
     image_media_type: str | None,
@@ -951,7 +948,7 @@ async def stream_graph_response(
     system_prompt: str | None = None,
     tool_call_max_iterations: int | None = None,
 ) -> AsyncIterator[str]:
-
+    from conversation_store import get_messages, add_message
     from settings_store import get_settings as _get_settings
     defaults = _get_settings()
 
@@ -962,6 +959,16 @@ async def stream_graph_response(
     eff_system_prompt = system_prompt if system_prompt is not None else defaults["system_prompt"]
     eff_max_iterations = tool_call_max_iterations if tool_call_max_iterations is not None else defaults["tool_call_max_iterations"]
 
+    # Save user message to DB
+    user_msg_data: dict = {"role": "user", "content": new_message}
+    if image_base64:
+        user_msg_data["image_base64"] = image_base64
+        user_msg_data["image_media_type"] = image_media_type
+    await add_message(conversation_id, user_msg_data)
+
+    # Load history from DB (includes the user message we just saved)
+    db_messages = await get_messages(conversation_id)
+
     def deserialize(m: dict) -> AnyMessage:
         if m["role"] == "user":
             return HumanMessage(content=m["content"])
@@ -969,7 +976,8 @@ async def stream_graph_response(
             return AIMessage(content=m["content"])
         return HumanMessage(content=m["content"])
 
-    raw_history = [deserialize(m) for m in messages]
+    # Exclude the last message (current user message) — it will be added by node_call_model
+    raw_history = [deserialize(m) for m in db_messages[:-1]]
     history = truncate_history(raw_history, eff_max_history)
     if len(history) < len(raw_history):
         log.info(f"[HISTORY] Truncated {len(raw_history)} → {len(history)} messages ({estimate_tokens(history)} tokens)")
@@ -987,7 +995,7 @@ async def stream_graph_response(
         "tool_call_iterations": 0,
     }
 
-    graph_thread_id = f"{thread_id}_{uuid.uuid4().hex[:8]}"
+    graph_thread_id = f"{conversation_id}_{uuid.uuid4().hex[:8]}"
 
     config: RunnableConfig = {"configurable": {
         "thread_id": graph_thread_id,
@@ -1016,6 +1024,55 @@ async def stream_graph_response(
         graph, initial_state, config, thinking_mode, graph_thread_id
     ):
         yield sse_line
+
+    # Save assistant response to DB after streaming completes
+    try:
+        state_snapshot = await graph.aget_state(config)
+        final_state = state_snapshot.values or {}
+        final_messages = final_state.get("messages", [])
+
+        # Find the last AIMessage — that's the assistant response
+        assistant_content = ""
+        tool_calls_log = final_state.get("tool_calls_log", [])
+        images: list[dict] = []
+
+        for m in reversed(final_messages):
+            if isinstance(m, AIMessage):
+                raw = m.content or ""
+                if isinstance(raw, list):
+                    assistant_content = "".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b) for b in raw
+                    )
+                else:
+                    assistant_content = raw
+                break
+
+        # Extract images from tool_calls_log (send_image results with base64)
+        for entry in tool_calls_log:
+            if entry.get("name") == "send_image":
+                try:
+                    result = json.loads(entry["result"]) if isinstance(entry["result"], str) else entry["result"]
+                    if isinstance(result, dict) and result.get("status") == "success" and "base64" in result:
+                        images.append({
+                            "file_path": result.get("file_path", ""),
+                            "media_type": result.get("media_type", ""),
+                            "base64": result["base64"],
+                        })
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    pass
+
+        assistant_msg_data: dict = {
+            "role": "assistant",
+            "content": assistant_content,
+        }
+        if tool_calls_log:
+            assistant_msg_data["tool_calls"] = tool_calls_log
+        if images:
+            assistant_msg_data["images"] = images
+
+        await add_message(conversation_id, assistant_msg_data)
+    except Exception as e:
+        log.error(f"[SAVE] Failed to save assistant message: {e}")
 
 
 async def resume_graph_response(

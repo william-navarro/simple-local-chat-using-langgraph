@@ -2,6 +2,7 @@ import { create } from "zustand"
 import { persist, type PersistStorage, type StorageValue } from "zustand/middleware"
 import { v4 as uuidv4 } from "uuid"
 import type { Conversation, Message, MessageType, ToolCallInfo, ImageResult, LLMProvider, GlobalSettings, ConversationSettings } from "../types"
+import { createConversationApi, deleteConversationApi, updateTitleApi, fetchConversations, fetchConversation } from "../lib/api"
 
 /** Wraps localStorage with a throttled setItem to avoid writes on every token. */
 function createThrottledStorage<T>(delay = 1000): PersistStorage<T> {
@@ -65,9 +66,11 @@ interface ChatStore {
   clearConversationSettings: (conversationId: string) => void
   getEffectiveSettings: () => GlobalSettings
   setSelectedProvider: (provider: LLMProvider) => void
-  createConversation: () => string
+  createConversation: () => Promise<string>
   deleteConversation: (id: string) => void
   setActiveConversation: (id: string) => void
+  loadConversations: () => Promise<void>
+  loadConversation: (id: string) => Promise<void>
   addMessage: (conversationId: string, message: Omit<Message, "id" | "timestamp">) => string
   appendToken: (conversationId: string, messageId: string, token: string) => void
   setTitle: (conversationId: string, title: string) => void
@@ -144,7 +147,7 @@ export const useChatStore = create<ChatStore>()(
         } as GlobalSettings
       },
 
-      createConversation: () => {
+      createConversation: async () => {
         const id = uuidv4()
         const now = Date.now()
         const conversation: Conversation = {
@@ -158,6 +161,8 @@ export const useChatStore = create<ChatStore>()(
           conversations: [conversation, ...state.conversations],
           activeConversationId: id,
         }))
+        // Fire-and-forget backend creation
+        createConversationApi(id, "New conversation")
         return id
       },
 
@@ -170,6 +175,8 @@ export const useChatStore = create<ChatStore>()(
               : state.activeConversationId
           return { conversations: remaining, activeConversationId: newActive }
         })
+        // Fire-and-forget backend deletion
+        deleteConversationApi(id)
       },
 
       setActiveConversation: (id) => set({ activeConversationId: id }),
@@ -218,6 +225,8 @@ export const useChatStore = create<ChatStore>()(
             c.id === conversationId ? { ...c, title: clean } : c
           ),
         }))
+        // Fire-and-forget backend update
+        updateTitleApi(conversationId, clean)
       },
 
       setMessageType: (conversationId, messageId, type) => {
@@ -282,6 +291,54 @@ export const useChatStore = create<ChatStore>()(
       setSelectedProvider: (provider) => set({ selectedProvider: provider, selectedModel: "" }),
       setSelectedModel: (model) => set({ selectedModel: model }),
 
+      loadConversations: async () => {
+        const metas = await fetchConversations()
+        if (!metas.length) return
+        // Merge: keep in-memory conversations that may have unsaved streaming state,
+        // add any from backend that aren't already loaded
+        const existing = new Map(get().conversations.map((c) => [c.id, c]))
+        const merged: Conversation[] = metas.map((m) => {
+          const local = existing.get(m.id)
+          if (local) return local
+          return {
+            id: m.id,
+            title: m.title,
+            messages: [], // messages loaded on demand
+            createdAt: m.created_at * 1000,
+            updatedAt: m.updated_at * 1000,
+          }
+        })
+        set({ conversations: merged })
+      },
+
+      loadConversation: async (id) => {
+        const detail = await fetchConversation(id)
+        if (!detail) return
+        set((state) => ({
+          conversations: state.conversations.map((c) => {
+            if (c.id !== id) return c
+            // Only replace messages if the conversation has no locally-loaded messages
+            // (avoids overwriting in-progress streaming)
+            if (c.messages.length > 0) return c
+            return {
+              ...c,
+              title: detail.title,
+              messages: detail.messages.map((m) => ({
+                id: m.id,
+                role: m.role as Message["role"],
+                content: m.content,
+                messageType: (m.message_type ?? undefined) as Message["messageType"],
+                toolCalls: m.tool_calls as unknown as ToolCallInfo[] | undefined,
+                images: m.images as unknown as ImageResult[] | undefined,
+                timestamp: m.timestamp * 1000,
+              })),
+              createdAt: detail.created_at * 1000,
+              updatedAt: detail.updated_at * 1000,
+            }
+          }),
+        }))
+      },
+
       getActiveConversation: () => {
         const { conversations, activeConversationId } = get()
         return conversations.find((c) => c.id === activeConversationId) ?? null
@@ -291,7 +348,6 @@ export const useChatStore = create<ChatStore>()(
       name: "langgraph-chat-storage",
       storage: throttledStorage,
       partialize: (state) => ({
-        conversations: state.conversations,
         activeConversationId: state.activeConversationId,
         thinkingMode: state.thinkingMode,
         webSearchMode: state.webSearchMode,

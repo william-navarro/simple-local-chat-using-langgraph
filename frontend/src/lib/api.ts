@@ -1,4 +1,4 @@
-import type { ChatRequest, StreamEvent, TerminalResult, ProviderInfo, GlobalSettings, ApiKeysState, ProviderUrlsState } from "../types"
+import type { ChatRequest, StreamEvent, TerminalResult, ProviderInfo, GlobalSettings, ApiKeysState, ProviderUrlsState, ConversationMeta, ConversationDetail } from "../types"
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 
@@ -133,6 +133,61 @@ export async function* resumeGraph(
       }
     }
   }
+}
+
+// --- Conversations ---
+
+export async function fetchConversations(): Promise<ConversationMeta[]> {
+  try {
+    const res = await fetch(`${BASE_URL}/conversations`)
+    if (!res.ok) return []
+    return await res.json()
+  } catch {
+    return []
+  }
+}
+
+export async function fetchConversation(id: string): Promise<ConversationDetail | null> {
+  try {
+    const res = await fetch(`${BASE_URL}/conversations/${id}`)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+export async function createConversationApi(id?: string, title?: string): Promise<ConversationMeta | null> {
+  try {
+    const body: Record<string, string> = {}
+    if (id) body.id = id
+    if (title) body.title = title
+    const res = await fetch(`${BASE_URL}/conversations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+export async function deleteConversationApi(id: string): Promise<void> {
+  try {
+    await fetch(`${BASE_URL}/conversations/${id}`, { method: "DELETE" })
+  } catch { /* fire-and-forget */ }
+}
+
+export async function updateTitleApi(id: string, title: string): Promise<void> {
+  try {
+    await fetch(`${BASE_URL}/conversations/${id}/title`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    })
+  } catch { /* fire-and-forget */ }
 }
 
 export async function fetchProviders(): Promise<ProviderInfo[]> {

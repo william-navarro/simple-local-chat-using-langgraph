@@ -20,12 +20,21 @@ from schemas import (
     ResumeRequest,
     GlobalSettings, ApiKeysUpdate, ApiKeysResponse,
     ProviderUrlsUpdate, ProviderUrlsResponse,
+    ConversationMeta, ConversationOut, CreateConversationRequest, UpdateTitleRequest,
 )
 from graph import stream_graph_response, resume_graph_response, generate_title_from_message, get_compiled_graph, close_checkpointer
 from providers import check_provider_status, fetch_provider_models, list_all_providers
 from model_cache import refresh_all_cloud_models
 from settings_store import get_settings, update_settings
 from tools import execute_terminal_command
+from conversation_store import (
+    init_db as init_conversation_db,
+    create_conversation as db_create_conversation,
+    list_conversations as db_list_conversations,
+    get_conversation as db_get_conversation,
+    delete_conversation as db_delete_conversation,
+    update_title as db_update_title,
+)
 
 app = FastAPI(
     title="LangGraph Chat API",
@@ -44,9 +53,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
-    """Initialize checkpointer and refresh cloud model lists on backend startup."""
+    """Initialize checkpointer, conversation DB, and refresh cloud model lists."""
     await get_compiled_graph()
     logging.info("[STARTUP] LangGraph checkpointer initialized")
+    await init_conversation_db()
+    logging.info("[STARTUP] Conversation DB initialized")
     results = await refresh_all_cloud_models()
     for provider, models in results.items():
         logging.info(f"[STARTUP] {provider}: {len(models)} models cached")
@@ -104,6 +115,48 @@ async def lmstudio_models():
     return {"models": models}
 
 
+# --- Conversation CRUD ---
+
+@app.get("/conversations", response_model=list[ConversationMeta])
+async def conversations_list():
+    return await db_list_conversations()
+
+
+@app.get("/conversations/{conv_id}", response_model=ConversationOut)
+async def conversation_get(conv_id: str):
+    from fastapi import HTTPException
+    conv = await db_get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conv
+
+
+@app.post("/conversations", response_model=ConversationMeta)
+async def conversation_create(body: CreateConversationRequest):
+    conv = await db_create_conversation(conv_id=body.id, title=body.title)
+    return {**conv, "message_count": 0}
+
+
+@app.delete("/conversations/{conv_id}")
+async def conversation_delete(conv_id: str):
+    from fastapi import HTTPException
+    deleted = await db_delete_conversation(conv_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "ok"}
+
+
+@app.put("/conversations/{conv_id}/title")
+async def conversation_update_title(conv_id: str, body: UpdateTitleRequest):
+    from fastapi import HTTPException
+    updated = await db_update_title(conv_id, body.title)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "ok"}
+
+
+# --- Chat ---
+
 @app.post(
     "/chat/title",
     response_model=TitleResponse,
@@ -127,8 +180,7 @@ async def chat_stream(request: ChatRequest):
     async def event_generator():
         try:
             async for chunk in stream_graph_response(
-                thread_id=request.thread_id,
-                messages=[m.model_dump() for m in request.messages],
+                conversation_id=request.conversation_id,
                 new_message=request.new_message,
                 image_base64=request.image_base64,
                 image_media_type=request.image_media_type,

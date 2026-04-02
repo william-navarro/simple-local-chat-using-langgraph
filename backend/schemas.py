@@ -10,8 +10,7 @@ class Message(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    thread_id: str
-    messages: list[Message]
+    conversation_id: str
     new_message: str
     image_base64: str | None = None
     image_media_type: str | None = None
@@ -99,3 +98,43 @@ class ProviderUrlsResponse(BaseModel):
     lm_studio_url: str
     ollama_url: str
     cli_proxy_url: str
+
+
+# --- Conversation schemas ---
+
+class ConversationMeta(BaseModel):
+    """Lightweight conversation metadata for listing."""
+    id: str
+    title: str
+    created_at: float
+    updated_at: float
+    message_count: int = 0
+
+
+class MessageOut(BaseModel):
+    """Full message for API responses."""
+    id: str
+    role: str
+    content: str
+    message_type: str | None = None
+    tool_calls: list[dict] | None = None
+    images: list[dict] | None = None
+    timestamp: float
+
+
+class ConversationOut(BaseModel):
+    """Full conversation with messages."""
+    id: str
+    title: str
+    messages: list[MessageOut]
+    created_at: float
+    updated_at: float
+
+
+class CreateConversationRequest(BaseModel):
+    id: str | None = None
+    title: str = "New conversation"
+
+
+class UpdateTitleRequest(BaseModel):
+    title: str

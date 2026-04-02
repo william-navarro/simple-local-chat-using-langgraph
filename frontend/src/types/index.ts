@@ -92,13 +92,7 @@ export interface StreamEvent {
 }
 
 export interface ChatRequest {
-  thread_id: string
-  messages: {
-    role: MessageRole
-    content: string
-    image_base64?: string
-    image_media_type?: string
-  }[]
+  conversation_id: string
   new_message: string
   image_base64?: string
   image_media_type?: string
@@ -113,6 +107,32 @@ export interface ChatRequest {
   max_history_tokens?: number
   system_prompt?: string
   tool_call_max_iterations?: number
+}
+
+export interface ConversationMeta {
+  id: string
+  title: string
+  created_at: number
+  updated_at: number
+  message_count: number
+}
+
+export interface BackendMessage {
+  id: string
+  role: string
+  content: string
+  message_type?: string | null
+  tool_calls?: Record<string, unknown>[] | null
+  images?: Record<string, unknown>[] | null
+  timestamp: number
+}
+
+export interface ConversationDetail {
+  id: string
+  title: string
+  messages: BackendMessage[]
+  created_at: number
+  updated_at: number
 }
 
 export interface GlobalSettings {
