@@ -46,6 +46,22 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
             ON messages(conversation_id)
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tool_executions (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                risk_level TEXT NOT NULL DEFAULT 'low',
+                args TEXT,
+                result_summary TEXT,
+                timestamp REAL NOT NULL,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_executions_conversation_id
+            ON tool_executions(conversation_id)
+        """)
         await db.commit()
 
 
@@ -185,6 +201,27 @@ async def get_messages(conv_id: str) -> list[dict]:
         )
         rows = await cursor.fetchall()
         return [_deserialize_message(r) for r in rows]
+
+
+async def log_tool_execution(
+    conv_id: str,
+    tool_name: str,
+    risk_level: str,
+    args: dict,
+    result_summary: str,
+) -> None:
+    """Append a tool execution record for audit purposes."""
+    exec_id = str(uuid.uuid4())
+    now = time.time()
+    async with aiosqlite.connect(str(_DB_PATH)) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute(
+            """INSERT INTO tool_executions
+               (id, conversation_id, tool_name, risk_level, args, result_summary, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (exec_id, conv_id, tool_name, risk_level, json.dumps(args), result_summary, now),
+        )
+        await db.commit()
 
 
 def _deserialize_message(row: aiosqlite.Row) -> dict:

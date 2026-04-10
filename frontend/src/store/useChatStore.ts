@@ -40,6 +40,8 @@ export interface PendingTerminalCommand {
   command: string
   workingDirectory: string
   shell: string
+  explanation?: string
+  riskLevel?: string
 }
 
 interface ChatStore {

@@ -66,6 +66,8 @@ export function InputBar() {
         <TerminalConfirmDialog
           command={pendingTerminalCommand.command}
           shell={pendingTerminalCommand.shell}
+          explanation={pendingTerminalCommand.explanation}
+          riskLevel={pendingTerminalCommand.riskLevel}
           onApprove={() => resolveTerminalApproval("approve")}
           onApproveAlways={() => resolveTerminalApproval("approve_always")}
           onDeny={() => resolveTerminalApproval("deny")}

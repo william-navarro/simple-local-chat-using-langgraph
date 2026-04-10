@@ -2,6 +2,7 @@ import base64
 import json
 import mimetypes
 import os
+import pathlib
 import platform
 import subprocess
 
@@ -10,12 +11,29 @@ from duckduckgo_search import DDGS
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg"}
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_FILE_READ_BYTES = 500 * 1024   # 500 KB for ReadFileTool
 
 IS_WINDOWS = platform.system() == "Windows"
 
 
+# --- Risk classification ---
+
+TOOL_RISK: dict[str, str] = {
+    "WebSearchTool": "low",
+    "SendImageTool": "low",
+    "ReadFileTool": "low",
+    "GlobTool": "low",
+    "WriteFileTool": "high",
+    "TerminalTool": "high",
+}
+
+
+# ---------------------------------------------------------------------------
+# WebSearchTool
+# ---------------------------------------------------------------------------
+
 @tool
-def web_search(query: str, num_results: int = 5) -> str:
+def WebSearchTool(query: str, num_results: int = 5) -> str:
     """Search the web for current information. Use this when the user asks about
     recent events, real-time data, current prices, weather, news, or anything
     that may require up-to-date information beyond your training. Consider data
@@ -46,7 +64,9 @@ def web_search(query: str, num_results: int = 5) -> str:
         return json.dumps({"status": "error", "message": f"Search failed: {str(e)}"})
 
 
-# --- Terminal tool ---
+# ---------------------------------------------------------------------------
+# TerminalTool
+# ---------------------------------------------------------------------------
 
 ALLOWED_COMMANDS = {
     # Cross-platform / basic
@@ -156,8 +176,72 @@ def _split_pipeline(cmd: str) -> list[str]:
     return segments
 
 
+# Static explanation hints for common command patterns (avoids LLM call)
+_CMD_HINTS: list[tuple[str, str]] = [
+    ("git log", "Viewing git commit history"),
+    ("git diff", "Showing uncommitted changes"),
+    ("git status", "Checking git working tree status"),
+    ("git branch", "Listing git branches"),
+    ("git show", "Showing a git commit or object"),
+    ("git ls-files", "Listing files tracked by git"),
+    ("dir ", "Listing directory contents"),
+    ("dir/", "Listing directory contents"),
+    ("ls ", "Listing directory contents"),
+    ("ls\n", "Listing directory contents"),
+    ("get-childitem", "Listing directory contents"),
+    ("gci ", "Listing directory contents"),
+    ("cat ", "Reading file contents"),
+    ("type ", "Reading file contents"),
+    ("get-content", "Reading file contents"),
+    ("gc ", "Reading file contents"),
+    ("head ", "Reading first lines of a file"),
+    ("tail ", "Reading last lines of a file"),
+    ("find ", "Searching for files"),
+    ("grep ", "Searching file contents"),
+    ("select-string", "Searching file contents"),
+    ("tree ", "Showing directory tree structure"),
+    ("tree\n", "Showing directory tree structure"),
+    ("pwd", "Showing current working directory"),
+    ("get-location", "Showing current working directory"),
+    ("whoami", "Checking current user identity"),
+    ("systeminfo", "Reading system information"),
+    ("get-computerinfo", "Reading system information"),
+    ("df ", "Checking disk space usage"),
+    ("du ", "Checking directory size"),
+    ("get-disk", "Checking disk information"),
+    ("get-volume", "Checking volume information"),
+    ("pip list", "Listing installed Python packages"),
+    ("pip freeze", "Listing installed Python packages"),
+    ("python --version", "Checking Python version"),
+    ("node --version", "Checking Node.js version"),
+    ("npm --version", "Checking npm version"),
+    ("dotnet --version", "Checking .NET version"),
+    ("get-process", "Listing running processes"),
+    ("get-service", "Listing system services"),
+    ("wc ", "Counting lines/words/characters"),
+    ("echo ", "Printing text output"),
+    ("set ", "Listing environment variables"),
+    ("env", "Listing environment variables"),
+    ("printenv", "Listing environment variables"),
+]
+
+
+def explain_command(command: str, shell: str = "cmd") -> str:
+    """Return a short human-readable explanation of what a command does.
+
+    Matches against static hints first; falls back to a generic description.
+    """
+    lower = command.lower().strip()
+    for pattern, explanation in _CMD_HINTS:
+        if lower.startswith(pattern.strip()) or pattern.strip() in lower:
+            return explanation
+    # Generic fallback based on first token
+    first = lower.split()[0] if lower.split() else lower
+    return f"Running '{first}' command in {shell.upper()}"
+
+
 @tool
-def terminal_execute(command: str, working_directory: str = ".", shell: str = "cmd") -> str:
+def TerminalTool(command: str, working_directory: str = ".", shell: str = "cmd") -> str:
     """Execute a read-only shell command on the user's machine.
     Use this to inspect files, check directory contents, view git status,
     read file contents, or get system information.
@@ -168,13 +252,11 @@ def terminal_execute(command: str, working_directory: str = ".", shell: str = "c
     try:
         cmd_lower = command.lower().strip()
         shell_lower = shell.lower().strip() if shell else "cmd"
-        # Normalize: accept variations like "ps", "pwsh"
         if shell_lower in ("powershell", "ps", "pwsh"):
             shell_lower = "powershell"
         else:
             shell_lower = "cmd"
 
-        # Blocklist check (on the full command string)
         for blocked in BLOCKED_TOKENS:
             if blocked in cmd_lower:
                 return json.dumps({
@@ -183,7 +265,6 @@ def terminal_execute(command: str, working_directory: str = ".", shell: str = "c
                     "message": f"Command blocked for safety: contains '{blocked.strip()}'",
                 })
 
-        # Split by top-level pipe only (ignore | inside {}, (), quotes)
         segments = _split_pipeline(cmd_lower)
 
         for segment in segments:
@@ -205,44 +286,26 @@ def terminal_execute(command: str, working_directory: str = ".", shell: str = "c
 
         if IS_WINDOWS:
             if shell_lower == "powershell":
-                # Use -EncodedCommand to avoid PowerShell escape interpretation
-                # (e.g. \b in paths like D:\bkp being treated as backspace)
                 encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
                 result = subprocess.run(
                     ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    cwd=cwd,
-                    encoding="utf-8",
-                    errors="replace",
+                    capture_output=True, text=True, timeout=15, cwd=cwd,
+                    encoding="utf-8", errors="replace",
                 )
             else:
-                # CMD mode — use cmd /C
                 result = subprocess.run(
                     ["cmd", "/C", command],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    cwd=cwd,
-                    encoding="utf-8",
-                    errors="replace",
+                    capture_output=True, text=True, timeout=15, cwd=cwd,
+                    encoding="utf-8", errors="replace",
                 )
         else:
             result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                cwd=cwd,
-                encoding="utf-8",
-                errors="replace",
+                command, shell=True, capture_output=True, text=True,
+                timeout=15, cwd=cwd, encoding="utf-8", errors="replace",
             )
 
         stdout = result.stdout[:15000] if result.stdout else ""
         stderr = result.stderr[:10000] if result.stderr else ""
-        # Filter out PowerShell CLIXML progress messages (not real errors)
         if stderr.startswith("#< CLIXML"):
             stderr = ""
         truncated = len(result.stdout or "") > 15000
@@ -273,12 +336,16 @@ def terminal_execute(command: str, working_directory: str = ".", shell: str = "c
 def execute_terminal_command(command: str, working_directory: str = ".", shell: str = "cmd") -> dict:
     """Execute a terminal command directly (used by the approval endpoint).
     Returns a parsed dict instead of a JSON string."""
-    result_json = terminal_execute.invoke({"command": command, "working_directory": working_directory, "shell": shell})
+    result_json = TerminalTool.invoke({"command": command, "working_directory": working_directory, "shell": shell})
     return json.loads(result_json)
 
 
+# ---------------------------------------------------------------------------
+# SendImageTool
+# ---------------------------------------------------------------------------
+
 @tool
-def send_image(file_path: str) -> str:
+def SendImageTool(file_path: str) -> str:
     """Send an image file from the user's machine to display in the chat.
     Use this when the user asks you to show, display, or retrieve an image
     from a local path. Supported formats: JPG, JPEG, PNG, GIF, BMP, WEBP, SVG."""
@@ -330,4 +397,175 @@ def send_image(file_path: str) -> str:
         })
 
 
-ALL_TOOLS = [web_search, terminal_execute, send_image]
+# ---------------------------------------------------------------------------
+# ReadFileTool
+# ---------------------------------------------------------------------------
+
+@tool
+def ReadFileTool(file_path: str, max_lines: int = 200) -> str:
+    """Read the contents of a text file from the user's machine.
+    Prefer this over TerminalTool when you only need to read a file —
+    it is faster, safer, and does not require user approval.
+    Returns the file content with line numbers. Use max_lines to limit output."""
+    try:
+        file_path = os.path.expanduser(file_path)
+
+        # Require absolute path to prevent traversal ambiguity
+        if not os.path.isabs(file_path):
+            return json.dumps({
+                "status": "error",
+                "message": "Please provide an absolute file path.",
+            })
+
+        # Resolve and guard against path traversal
+        resolved = pathlib.Path(file_path).resolve()
+        if not resolved.exists():
+            return json.dumps({
+                "status": "error",
+                "message": f"File not found: {file_path}",
+            })
+
+        if not resolved.is_file():
+            return json.dumps({
+                "status": "error",
+                "message": f"Path is not a file: {file_path}",
+            })
+
+        file_size = resolved.stat().st_size
+        if file_size > MAX_FILE_READ_BYTES:
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"File too large ({file_size // 1024}KB). "
+                    f"Max: {MAX_FILE_READ_BYTES // 1024}KB. "
+                    "Use max_lines to read a portion, or use GlobTool to inspect structure."
+                ),
+            })
+
+        with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+
+        total_lines = len(lines)
+        max_lines = max(1, min(max_lines, 2000))
+        truncated = total_lines > max_lines
+        content = "".join(
+            f"{i + 1}: {line}" for i, line in enumerate(lines[:max_lines])
+        )
+
+        return json.dumps({
+            "status": "success",
+            "file_path": str(resolved),
+            "total_lines": total_lines,
+            "lines_returned": min(total_lines, max_lines),
+            "truncated": truncated,
+            "content": content,
+        })
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to read file: {str(e)}",
+        })
+
+
+# ---------------------------------------------------------------------------
+# WriteFileTool
+# ---------------------------------------------------------------------------
+
+@tool
+def WriteFileTool(file_path: str, content: str, create_dirs: bool = False) -> str:
+    """Write (create or overwrite) a text file on the user's machine.
+    Requires user approval before executing.
+    Set create_dirs=True to automatically create parent directories if missing."""
+    try:
+        file_path = os.path.expanduser(file_path)
+
+        if not os.path.isabs(file_path):
+            return json.dumps({
+                "status": "error",
+                "message": "Please provide an absolute file path.",
+            })
+
+        resolved = pathlib.Path(file_path).resolve()
+
+        if create_dirs:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        elif not resolved.parent.exists():
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"Parent directory does not exist: {resolved.parent}. "
+                    "Set create_dirs=True to create it automatically."
+                ),
+            })
+
+        existed = resolved.exists()
+        resolved.write_text(content, encoding="utf-8")
+
+        return json.dumps({
+            "status": "success",
+            "file_path": str(resolved),
+            "action": "overwritten" if existed else "created",
+            "bytes_written": len(content.encode("utf-8")),
+        })
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Failed to write file: {str(e)}",
+        })
+
+
+# ---------------------------------------------------------------------------
+# GlobTool
+# ---------------------------------------------------------------------------
+
+@tool
+def GlobTool(pattern: str, base_path: str = ".", max_results: int = 100) -> str:
+    """Find files matching a glob pattern relative to a base path.
+    Examples: '**/*.py', 'src/**/*.ts', '*.json', 'docs/**/*.md'.
+    Use this to explore project structure without running shell commands.
+    Results are sorted by path. Use max_results to limit output (default 100)."""
+    try:
+        base = pathlib.Path(os.path.expanduser(base_path)).resolve()
+
+        if not base.exists():
+            return json.dumps({
+                "status": "error",
+                "message": f"Base path does not exist: {base_path}",
+            })
+
+        if not base.is_dir():
+            return json.dumps({
+                "status": "error",
+                "message": f"Base path is not a directory: {base_path}",
+            })
+
+        max_results = max(1, min(max_results, 500))
+        matches = sorted(base.glob(pattern))
+        # Filter to files only (exclude directories from results)
+        file_matches = [p for p in matches if p.is_file()]
+        truncated = len(file_matches) > max_results
+        returned = file_matches[:max_results]
+
+        return json.dumps({
+            "status": "success",
+            "pattern": pattern,
+            "base_path": str(base),
+            "total_matches": len(file_matches),
+            "truncated": truncated,
+            "files": [str(p) for p in returned],
+        })
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"Glob failed: {str(e)}",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
+
+ALL_TOOLS = [WebSearchTool, TerminalTool, SendImageTool, ReadFileTool, WriteFileTool, GlobTool]

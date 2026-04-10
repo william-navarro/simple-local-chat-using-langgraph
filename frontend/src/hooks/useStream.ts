@@ -73,10 +73,16 @@ export function useStream() {
     setPendingTerminalCommand(null)
   }, [setPendingTerminalCommand])
 
-  const waitForApproval = useCallback((command: string, workingDirectory: string, shell = "cmd"): Promise<TerminalApprovalResult> => {
+  const waitForApproval = useCallback((
+    command: string,
+    workingDirectory: string,
+    shell = "cmd",
+    explanation?: string,
+    riskLevel?: string,
+  ): Promise<TerminalApprovalResult> => {
     return new Promise((resolve) => {
       approvalResolveRef.current = resolve
-      setPendingTerminalCommand({ command, workingDirectory, shell })
+      setPendingTerminalCommand({ command, workingDirectory, shell, explanation, riskLevel })
     })
   }, [setPendingTerminalCommand])
 
@@ -175,6 +181,8 @@ export function useStream() {
               const command = pending.command ?? ""
               const workingDirectory = pending.working_directory ?? "."
               const shell = pending.shell ?? "cmd"
+              const explanation = pending.explanation as string | undefined
+              const riskLevel = pending.risk_level as string | undefined
               // graph_thread_id is sent by backend for resume (unique per request)
               const graphThreadId = pending.graph_thread_id ?? conversationId
 
@@ -185,7 +193,7 @@ export function useStream() {
               if (autoApprove) {
                 decision = "approve"
               } else {
-                decision = await waitForApproval(command, workingDirectory, shell)
+                decision = await waitForApproval(command, workingDirectory, shell, explanation, riskLevel)
               }
 
               if (abortController.signal.aborted) break
@@ -208,7 +216,7 @@ export function useStream() {
                 execResult = result as unknown as Record<string, unknown>
 
                 const tcInfo: ToolCallInfo = {
-                  name: "terminal_execute",
+                  name: "TerminalTool",
                   query: "",
                   command,
                   shell,
@@ -230,7 +238,7 @@ export function useStream() {
                 setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
               } else {
                 const tcInfo: ToolCallInfo = {
-                  name: "terminal_execute",
+                  name: "TerminalTool",
                   query: "",
                   command,
                   shell,
@@ -277,6 +285,8 @@ export function useStream() {
                       const nestedCommand = nestedPending.command ?? ""
                       const nestedWd = nestedPending.working_directory ?? "."
                       const nestedShell = nestedPending.shell ?? "cmd"
+                      const nestedExplanation = nestedPending.explanation as string | undefined
+                      const nestedRiskLevel = nestedPending.risk_level as string | undefined
                       currentGraphThreadId = nestedPending.graph_thread_id ?? currentGraphThreadId
 
                       const nestedAutoApprove = useChatStore.getState().autoApproveTerminal
@@ -284,7 +294,7 @@ export function useStream() {
                       if (nestedAutoApprove) {
                         nestedDecision = "approve"
                       } else {
-                        nestedDecision = await waitForApproval(nestedCommand, nestedWd, nestedShell)
+                        nestedDecision = await waitForApproval(nestedCommand, nestedWd, nestedShell, nestedExplanation, nestedRiskLevel)
                       }
 
                       if (resumeAbort.signal.aborted) break
@@ -306,7 +316,7 @@ export function useStream() {
                         currentExecResult = nestedResult as unknown as Record<string, unknown>
 
                         const nestedTcInfo: ToolCallInfo = {
-                          name: "terminal_execute",
+                          name: "TerminalTool",
                           query: "",
                           command: nestedCommand,
                           shell: nestedShell,
@@ -326,7 +336,7 @@ export function useStream() {
                         setToolCalls(conversationId, assistantMessageId, [...collectedToolCalls])
                       } else {
                         collectedToolCalls.push({
-                          name: "terminal_execute",
+                          name: "TerminalTool",
                           query: "",
                           command: nestedCommand,
                           shell: nestedShell,
@@ -351,7 +361,7 @@ export function useStream() {
                     setThinking(false)
                     try {
                       const info = JSON.parse(resumeEvent.content ?? "{}")
-                      if (info.name === "terminal_execute") {
+                      if (info.name === "TerminalTool") {
                         // Don't add to collectedToolCalls — the nested terminal_interrupt
                         // handler will add the entry with proper result data
                         setExecuting(true)
@@ -368,7 +378,7 @@ export function useStream() {
                     try {
                       const result = JSON.parse(resumeEvent.content ?? "{}")
                       const lastTc = collectedToolCalls[collectedToolCalls.length - 1]
-                      if (lastTc?.name === "terminal_execute") {
+                      if (lastTc?.name === "TerminalTool") {
                         if (result.status === "success") {
                           lastTc.terminalResult = {
                             command: result.command,
@@ -426,7 +436,7 @@ export function useStream() {
             setThinking(false)
             try {
               const info = JSON.parse(event.content ?? "{}")
-              if (info.name === "terminal_execute") {
+              if (info.name === "TerminalTool") {
                 // Don't add to collectedToolCalls here — the terminal_interrupt
                 // handler will add the entry with proper result data
                 setExecuting(true)
@@ -442,7 +452,7 @@ export function useStream() {
             try {
               const result = JSON.parse(event.content ?? "{}")
               const lastTc = collectedToolCalls[collectedToolCalls.length - 1]
-              if (lastTc?.name === "terminal_execute") {
+              if (lastTc?.name === "TerminalTool") {
                 if (result.status === "success") {
                   lastTc.terminalResult = {
                     command: result.command,

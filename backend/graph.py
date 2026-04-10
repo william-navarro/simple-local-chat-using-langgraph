@@ -26,7 +26,12 @@ from langgraph.types import interrupt, Command
 
 from config import settings
 from providers import get_llm
-from tools import ALL_TOOLS, web_search, terminal_execute, send_image
+from tools import (
+    ALL_TOOLS, TOOL_RISK,
+    WebSearchTool, TerminalTool, SendImageTool,
+    ReadFileTool, WriteFileTool, GlobTool,
+    explain_command,
+)
 
 
 # --- State (mutable execution data only) ---
@@ -66,10 +71,13 @@ def get_enabled_tools(conf: dict) -> list:
     """Return the list of tools to bind based on config flags."""
     tools = []
     if conf.get("web_search"):
-        tools.append(web_search)
+        tools.append(WebSearchTool)
     if conf.get("terminal_access"):
-        tools.append(terminal_execute)
-        tools.append(send_image)
+        tools.append(TerminalTool)
+        tools.append(SendImageTool)
+        tools.append(ReadFileTool)
+        tools.append(WriteFileTool)
+        tools.append(GlobTool)
     return tools
 
 
@@ -157,31 +165,33 @@ def build_system_prompt(
 
     if web_search:
         base += (
-            " You have a web_search tool. Use it for current events, real-time data, "
+            " You have WebSearchTool. Use it for current events, real-time data, "
             "or facts you're unsure about. Answer directly for general knowledge."
         )
 
     if terminal_access:
         os_name = platform.system()
         base += (
-            " You have terminal_execute and send_image(file_path: str) tools. "
-            "These are separate API tools — call them via tool_calls, NOT as shell commands. "
+            " You have these tools — call them via tool_calls, NOT as shell commands. "
             "ALWAYS call the tool — never simulate or fabricate output. "
             "You can call multiple tools at once (parallel tool calls). "
-            "You can chain tool calls across multiple rounds (e.g. list files, then send one). "
-            "When you call send_image, the image is displayed automatically to the user — "
-            "do NOT write markdown image links like ![alt](path) in your text response. "
-            "Retry on errors before explaining them. Avoid recursive scans on root dirs."
+            "You can chain tool calls across multiple rounds."
+            "\n- TerminalTool: run read-only shell commands (requires user approval)."
+            "\n- SendImageTool(file_path): display an image — do NOT write markdown image links after calling it."
+            "\n- ReadFileTool(file_path, max_lines): read a text file directly — prefer this over TerminalTool for file reads."
+            "\n- WriteFileTool(file_path, content, create_dirs): create or overwrite a text file (requires user approval)."
+            "\n- GlobTool(pattern, base_path): find files by glob pattern (e.g. '**/*.py') — prefer this over TerminalTool for file discovery."
+            "\nRetry on errors before explaining them. Avoid recursive scans on root dirs."
         )
         if os_name == "Windows":
             base += (
-                " terminal_execute has a 'shell' param: 'cmd' (default) or 'powershell'. "
+                " TerminalTool has a 'shell' param: 'cmd' (default) or 'powershell'. "
                 "Use shell='cmd' for CMD syntax (dir /Q, type, tree, etc.). "
                 "Use shell='powershell' for PowerShell cmdlets (Get-ChildItem, Get-Content, etc.). "
                 "Do NOT mix syntaxes — CMD flags (/Q, /S) fail in PowerShell and vice-versa."
             )
         else:
-            base += " terminal_execute runs bash commands (15s timeout)."
+            base += " TerminalTool runs bash commands (15s timeout)."
 
     # thinking_mode is handled entirely by the model's native behavior
     _ = thinking_mode
@@ -394,8 +404,8 @@ async def node_tool_executor(state: GraphState) -> GraphState:
       2. Execute non-terminal tools in parallel
       3. Process approved terminal commands
 
-    This ensures parallel tools (web_search, send_image) run only once,
-    even when the node is re-executed after an interrupt resume.
+    This ensures parallel tools (WebSearchTool, SendImageTool, ReadFileTool, GlobTool)
+    run only once, even when the node is re-executed after an interrupt resume.
     """
     last_msg = state["messages"][-1]
     tool_messages: list[ToolMessage] = []
@@ -403,30 +413,46 @@ async def node_tool_executor(state: GraphState) -> GraphState:
 
     tools_by_name = {t.name: t for t in ALL_TOOLS}
 
-    terminal_calls = []
+    # Tools that require user approval before execution
+    APPROVAL_TOOLS = {"TerminalTool", "WriteFileTool"}
+
+    approval_calls = []
     parallel_calls = []
     for tc in last_msg.tool_calls:
-        if tc["name"] == "terminal_execute":
-            terminal_calls.append(tc)
+        if tc["name"] in APPROVAL_TOOLS:
+            approval_calls.append(tc)
         else:
             parallel_calls.append(tc)
 
     # --- Phase 1: Collect ALL interrupt approvals (no side effects) ---
-    terminal_approvals: list[tuple[dict, dict]] = []
-    for tc in terminal_calls:
+    pending_approvals: list[tuple[dict, dict]] = []
+    for tc in approval_calls:
+        risk = TOOL_RISK.get(tc["name"], "high")
+        command = tc["args"].get("command", "")
+        shell = tc["args"].get("shell", "cmd")
+        explanation = explain_command(command, shell) if tc["name"] == "TerminalTool" else (
+            f"Write file: {tc['args'].get('file_path', '')}"
+        )
         approval = interrupt({
             "tool_call_id": tc["id"],
-            "command": tc["args"].get("command", ""),
+            "tool_name": tc["name"],
+            "command": command,
             "working_directory": tc["args"].get("working_directory", "."),
-            "shell": tc["args"].get("shell", "cmd"),
+            "shell": shell,
+            "explanation": explanation,
+            "risk_level": risk,
+            # WriteFileTool extras
+            "file_path": tc["args"].get("file_path", ""),
         })
-        terminal_approvals.append((tc, approval))
+        pending_approvals.append((tc, approval))
 
-    # --- Phase 2: Execute non-terminal tools in parallel ---
+    # --- Phase 2: Execute non-approval tools in parallel ---
     async def _exec_tool(tc: dict) -> tuple[dict, str]:
         tool_fn = tools_by_name.get(tc["name"])
         if not tool_fn:
             return tc, json.dumps({"status": "error", "message": f"Unknown tool: {tc['name']}"})
+        risk = TOOL_RISK.get(tc["name"], "low")
+        log.info(f"[TOOL] {tc['name']} risk={risk} args={list(tc['args'].keys())}")
         try:
             result = await asyncio.to_thread(tool_fn.invoke, tc["args"])
             return tc, _truncate_tool_result(str(result))
@@ -443,16 +469,19 @@ async def node_tool_executor(state: GraphState) -> GraphState:
                 "name": tc["name"],
                 "args": tc["args"],
                 "result": result,
+                "risk_level": TOOL_RISK.get(tc["name"], "low"),
             })
 
-    # --- Phase 3: Execute approved terminal commands ---
-    for tc, approval in terminal_approvals:
+    # --- Phase 3: Execute approved tools ---
+    for tc, approval in pending_approvals:
+        risk = TOOL_RISK.get(tc["name"], "high")
+        log.warning(f"[TOOL] {tc['name']} risk={risk} approved={approval.get('approved')} args={list(tc['args'].keys())}")
         if approval.get("approved"):
             result_data = approval.get("result")
             if result_data:
                 result = _truncate_tool_result(json.dumps(result_data))
             else:
-                tool_fn = tools_by_name.get("terminal_execute")
+                tool_fn = tools_by_name.get(tc["name"])
                 try:
                     result = _truncate_tool_result(
                         str(await asyncio.to_thread(tool_fn.invoke, tc["args"]))
@@ -469,6 +498,7 @@ async def node_tool_executor(state: GraphState) -> GraphState:
             "name": tc["name"],
             "args": tc["args"],
             "result": result,
+            "risk_level": risk,
         })
 
     return {
@@ -948,7 +978,7 @@ async def stream_graph_response(
     system_prompt: str | None = None,
     tool_call_max_iterations: int | None = None,
 ) -> AsyncIterator[str]:
-    from conversation_store import get_messages, add_message
+    from conversation_store import get_messages, add_message, log_tool_execution
     from settings_store import get_settings as _get_settings
     defaults = _get_settings()
 
@@ -1047,9 +1077,9 @@ async def stream_graph_response(
                     assistant_content = raw
                 break
 
-        # Extract images from tool_calls_log (send_image results with base64)
+        # Extract images from tool_calls_log (SendImageTool results with base64)
         for entry in tool_calls_log:
-            if entry.get("name") == "send_image":
+            if entry.get("name") == "SendImageTool":
                 try:
                     result = json.loads(entry["result"]) if isinstance(entry["result"], str) else entry["result"]
                     if isinstance(result, dict) and result.get("status") == "success" and "base64" in result:
@@ -1071,6 +1101,29 @@ async def stream_graph_response(
             assistant_msg_data["images"] = images
 
         await add_message(conversation_id, assistant_msg_data)
+
+        # Audit log: persist each tool execution to tool_executions table
+        for entry in tool_calls_log:
+            tool_name = entry.get("name", "unknown")
+            result_raw = entry.get("result", "")
+            try:
+                result_parsed = json.loads(result_raw) if isinstance(result_raw, str) else result_raw
+                status = result_parsed.get("status", "") if isinstance(result_parsed, dict) else ""
+                # Build a concise summary (no base64)
+                if isinstance(result_parsed, dict) and "base64" in result_parsed:
+                    summary = f"status={status} file={result_parsed.get('file_path', '')}"
+                else:
+                    summary = result_raw[:300]
+            except (json.JSONDecodeError, TypeError):
+                summary = str(result_raw)[:300]
+
+            await log_tool_execution(
+                conv_id=conversation_id,
+                tool_name=tool_name,
+                risk_level=entry.get("risk_level", TOOL_RISK.get(tool_name, "low")),
+                args=entry.get("args", {}),
+                result_summary=summary,
+            )
     except Exception as e:
         log.error(f"[SAVE] Failed to save assistant message: {e}")
 
