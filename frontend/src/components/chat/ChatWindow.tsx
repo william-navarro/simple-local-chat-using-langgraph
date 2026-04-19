@@ -1,10 +1,47 @@
+import { useCallback, useRef, useState } from "react"
 import { useChatStore } from "../../store/useChatStore"
 import { MessageList } from "./MessageList"
 import { InputBar } from "./InputBar"
-import { Bot, Brain, Globe, Terminal, Archive } from "lucide-react"
+import { LightboxProvider } from "./MessageItem"
+import { Bot, Brain, Globe, Terminal, Archive, ImageIcon } from "lucide-react"
 
 export function ChatWindow() {
   const { activeConversationId, getActiveConversation, createConversation, isThinking, isSearching, isExecuting, isCompressing, pendingTerminalCommand } = useChatStore()
+  const [isDragging, setIsDragging] = useState(false)
+  const [droppedImage, setDroppedImage] = useState<{ base64: string; mediaType: string; preview: string } | undefined>()
+  const dragCounter = useRef(0)
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    if ([...e.dataTransfer.items].some(i => i.kind === "file" && i.type.startsWith("image/"))) {
+      dragCounter.current++
+      setIsDragging(true)
+    }
+  }, [])
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    dragCounter.current--
+    if (dragCounter.current === 0) setIsDragging(false)
+  }, [])
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+  }, [])
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    dragCounter.current = 0
+    setIsDragging(false)
+    const file = [...e.dataTransfer.files].find(f => f.type.startsWith("image/"))
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result as string
+      setDroppedImage({ base64: result.split(",")[1], mediaType: file.type, preview: result })
+    }
+    reader.readAsDataURL(file)
+  }, [])
   const conversation = getActiveConversation()
 
   if (!activeConversationId || !conversation) {
@@ -32,7 +69,21 @@ export function ChatWindow() {
   }
 
   return (
-    <div className="flex flex-col flex-1 h-full bg-zinc-950">
+    <div
+      className="flex flex-col flex-1 h-full bg-zinc-950 relative"
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
+      {isDragging && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-violet-950/60 border-2 border-dashed border-violet-500 rounded-none pointer-events-none">
+          <div className="flex flex-col items-center gap-3 text-violet-300">
+            <ImageIcon size={48} className="opacity-80" />
+            <span className="text-lg font-medium">Solte a imagem para anexar</span>
+          </div>
+        </div>
+      )}
       <div className="flex items-center px-4 py-3 border-b border-zinc-800 bg-zinc-900 overflow-hidden">
         <h2 className="text-sm font-medium text-zinc-200 truncate min-w-0 flex-1">
           {conversation.title}
@@ -74,8 +125,10 @@ export function ChatWindow() {
         </div>
       </div>
 
-      <MessageList messages={conversation.messages} />
-      <InputBar />
+      <LightboxProvider>
+        <MessageList messages={conversation.messages} />
+      </LightboxProvider>
+      <InputBar droppedImage={droppedImage} onDroppedImageConsumed={() => setDroppedImage(undefined)} />
     </div>
   )
 }

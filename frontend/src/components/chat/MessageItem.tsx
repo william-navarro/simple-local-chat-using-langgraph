@@ -1,5 +1,5 @@
-import { Brain, Globe, Terminal, Tag, Bot, User, Copy, Check, X } from "lucide-react"
-import { useState, useEffect, useCallback, memo, useMemo } from "react"
+import { Brain, Globe, Terminal, Tag, Bot, User, Copy, Check, X, ChevronLeft, ChevronRight } from "lucide-react"
+import { useState, useEffect, useCallback, memo, useMemo, createContext, useContext } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter"
@@ -322,65 +322,178 @@ function TerminalBlock({ toolCalls }: { toolCalls: ToolCallInfo[] }) {
   )
 }
 
-function ImageBlock({ images }: { images: ImageResult[] }) {
-  const [expanded, setExpanded] = useState<ImageResult | null>(null)
+// --- Lightbox context (shared across all images in a conversation) ---
 
-  const close = useCallback(() => setExpanded(null), [])
+interface LightboxContextValue {
+  register: (id: string, src: string, label?: string) => void
+  unregister: (id: string) => void
+  open: (id: string) => void
+}
+
+const LightboxContext = createContext<LightboxContextValue | null>(null)
+
+export function LightboxProvider({ children }: { children: React.ReactNode }) {
+  // ordered list of registered images (insertion order = conversation order)
+  const [images, setImages] = useState<{ id: string; src: string; label?: string }[]>([])
+  const [currentIndex, setCurrentIndex] = useState<number | null>(null)
+
+  const register = useCallback((id: string, src: string, label?: string) => {
+    setImages(prev => {
+      if (prev.some(i => i.id === id)) return prev
+      return [...prev, { id, src, label }]
+    })
+  }, [])
+
+  const unregister = useCallback((id: string) => {
+    setImages(prev => prev.filter(i => i.id !== id))
+  }, [])
+
+  const open = useCallback((id: string) => {
+    setImages(prev => {
+      const idx = prev.findIndex(i => i.id === id)
+      if (idx !== -1) setCurrentIndex(idx)
+      return prev
+    })
+  }, [])
+
+  const close = useCallback(() => setCurrentIndex(null), [])
+
+  const prev = useCallback(() => setCurrentIndex(i => (i !== null && i > 0 ? i - 1 : i)), [])
+  const next = useCallback(() => setCurrentIndex(i => (i !== null && i < images.length - 1 ? i + 1 : i)), [images.length])
 
   useEffect(() => {
-    if (!expanded) return
+    if (currentIndex === null) return
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close()
+      else if (e.key === "ArrowLeft") prev()
+      else if (e.key === "ArrowRight") next()
     }
     window.addEventListener("keydown", handleKey)
     return () => window.removeEventListener("keydown", handleKey)
-  }, [expanded, close])
+  }, [currentIndex, close, prev, next])
 
-  if (images.length === 0) return null
+  const current = currentIndex !== null ? images[currentIndex] : null
 
   return (
-    <>
-      <div className="my-2 space-y-2">
-        {images.map((img, i) => (
-          <div key={i} className="rounded-lg overflow-hidden border border-zinc-700">
-            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-900 border-b border-zinc-700">
-              <span className="text-xs text-zinc-500 font-mono truncate">
-                {img.file_path.split(/[/\\]/).pop()}
-              </span>
-            </div>
-            <img
-              src={`data:${img.media_type};base64,${img.base64}`}
-              alt={img.file_path}
-              className="max-w-full max-h-96 object-contain bg-zinc-950 p-1 cursor-pointer hover:opacity-80 transition-opacity"
-              onClick={() => setExpanded(img)}
-            />
-          </div>
-        ))}
-      </div>
-
-      {expanded && (
+    <LightboxContext.Provider value={{ register, unregister, open }}>
+      {children}
+      {current && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
           onClick={close}
         >
+          {/* Counter */}
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 text-sm text-zinc-300 font-medium bg-black/50 px-3 py-1 rounded-full">
+            Image {currentIndex! + 1} of {images.length}
+          </div>
+
+          {/* Close */}
           <button
             onClick={close}
             className="absolute top-4 right-4 p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors z-10"
           >
             <X size={20} />
           </button>
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-xs text-zinc-500 font-mono truncate max-w-[80vw]">
-            {expanded.file_path}
-          </div>
+
+          {/* Prev arrow */}
+          {currentIndex! > 0 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); prev() }}
+              className="absolute left-4 top-1/2 -translate-y-1/2 p-2 rounded-full bg-black/50 text-zinc-300 hover:text-white hover:bg-black/80 transition-colors z-10"
+            >
+              <ChevronLeft size={32} />
+            </button>
+          )}
+
+          {/* Next arrow */}
+          {currentIndex! < images.length - 1 && (
+            <button
+              onClick={(e) => { e.stopPropagation(); next() }}
+              className="absolute right-4 top-1/2 -translate-y-1/2 p-2 rounded-full bg-black/50 text-zinc-300 hover:text-white hover:bg-black/80 transition-colors z-10"
+            >
+              <ChevronRight size={32} />
+            </button>
+          )}
+
+          {/* Image */}
           <img
-            src={`data:${expanded.media_type};base64,${expanded.base64}`}
-            alt={expanded.file_path}
-            className="max-w-[90vw] max-h-[90vh] object-contain"
+            src={current.src}
+            alt={current.label ?? "image"}
+            className="max-w-[80vw] max-h-[85vh] object-contain"
             onClick={(e) => e.stopPropagation()}
           />
+
+          {/* Label */}
+          {current.label && (
+            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-xs text-zinc-500 font-mono truncate max-w-[80vw]">
+              {current.label}
+            </div>
+          )}
         </div>
       )}
-    </>
+    </LightboxContext.Provider>
+  )
+}
+
+function useLightbox() {
+  const ctx = useContext(LightboxContext)
+  if (!ctx) throw new Error("useLightbox must be used inside LightboxProvider")
+  return ctx
+}
+
+// Thumbnail that registers itself in the global lightbox
+function LightboxThumbnail({
+  id, src, label, className,
+}: { id: string; src: string; label?: string; className?: string }) {
+  const { register, unregister, open } = useLightbox()
+
+  useEffect(() => {
+    register(id, src, label)
+    return () => unregister(id)
+  }, [id, src, label, register, unregister])
+
+  return (
+    <img
+      src={src}
+      alt={label ?? "image"}
+      className={className}
+      onClick={() => open(id)}
+    />
+  )
+}
+
+function UserImageThumbnail({ id, base64, mediaType }: { id: string; base64: string; mediaType: string }) {
+  const src = `data:${mediaType};base64,${base64}`
+  return (
+    <LightboxThumbnail
+      id={id}
+      src={src}
+      className="max-h-64 max-w-xs rounded-xl border border-zinc-700 object-contain mb-1 cursor-pointer hover:opacity-80 transition-opacity"
+    />
+  )
+}
+
+function ImageBlock({ messageId, images }: { messageId: string; images: ImageResult[] }) {
+  if (images.length === 0) return null
+
+  return (
+    <div className="my-2 space-y-2">
+      {images.map((img, i) => (
+        <div key={i} className="rounded-lg overflow-hidden border border-zinc-700">
+          <div className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-900 border-b border-zinc-700">
+            <span className="text-xs text-zinc-500 font-mono truncate">
+              {img.file_path.split(/[/\\]/).pop()}
+            </span>
+          </div>
+          <LightboxThumbnail
+            id={`${messageId}-img-${i}`}
+            src={`data:${img.media_type};base64,${img.base64}`}
+            label={img.file_path}
+            className="max-w-full max-h-96 object-contain bg-zinc-950 p-1 cursor-pointer hover:opacity-80 transition-opacity"
+          />
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -465,11 +578,11 @@ export const MessageItem = memo(function MessageItem({ message, isStreaming }: M
           </span>
         )}
 
-        {message.imageBase64 && message.imageMime && (
-          <img
-            src={`data:${message.imageMime};base64,${message.imageBase64}`}
-            alt="attached image"
-            className="max-h-48 rounded-xl border border-zinc-700 object-contain mb-1"
+        {message.imageBase64 && (
+          <UserImageThumbnail
+            id={`${message.id}-user-img`}
+            base64={message.imageBase64}
+            mediaType={message.imageMediaType ?? "image/png"}
           />
         )}
 
@@ -493,7 +606,7 @@ export const MessageItem = memo(function MessageItem({ message, isStreaming }: M
                 </>
               )}
               {message.images && message.images.length > 0 && (
-                <ImageBlock images={message.images} />
+                <ImageBlock messageId={message.id} images={message.images} />
               )}
               {parts?.map((part, i) =>
                 part.type === "thinking" ? (

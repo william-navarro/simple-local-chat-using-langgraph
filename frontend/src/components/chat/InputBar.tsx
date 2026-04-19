@@ -1,14 +1,27 @@
-import { useState, useRef, useCallback } from "react"
+import { useState, useRef, useCallback, useEffect } from "react"
 import { Send, Square, Paperclip, Brain, Globe, Terminal, Archive, X } from "lucide-react"
 import { useChatStore } from "../../store/useChatStore"
 import { useStream } from "../../hooks/useStream"
 import { TerminalConfirmDialog } from "./TerminalConfirmDialog"
 
-export function InputBar() {
+interface InputBarProps {
+  droppedImage?: { base64: string; mediaType: string; preview: string }
+  onDroppedImageConsumed?: () => void
+}
+
+export function InputBar({ droppedImage, onDroppedImageConsumed }: InputBarProps) {
   const [input, setInput] = useState("")
   const [imageBase64, setImageBase64] = useState<string | undefined>()
   const [imageMediaType, setImageMediaType] = useState<string | undefined>()
   const [imagePreview, setImagePreview] = useState<string | undefined>()
+
+  useEffect(() => {
+    if (!droppedImage) return
+    setImageBase64(droppedImage.base64)
+    setImageMediaType(droppedImage.mediaType)
+    setImagePreview(droppedImage.preview)
+    onDroppedImageConsumed?.()
+  }, [droppedImage, onDroppedImageConsumed])
 
   const { isStreaming, isThinking, isSearching, isExecuting, isCompressing, thinkingMode, webSearchMode, terminalMode, pendingTerminalCommand, toggleThinkingMode, toggleWebSearchMode, toggleTerminalMode } = useChatStore()
   const { sendMessage, stopStreaming, resolveTerminalApproval } = useStream()
@@ -36,6 +49,22 @@ export function InputBar() {
       handleSubmit()
     }
   }
+
+  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageFile = [...e.clipboardData.items]
+      .find(item => item.kind === "file" && item.type.startsWith("image/"))
+      ?.getAsFile()
+    if (!imageFile) return
+    e.preventDefault()
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result as string
+      setImageBase64(result.split(",")[1])
+      setImageMediaType(imageFile.type)
+      setImagePreview(result)
+    }
+    reader.readAsDataURL(imageFile)
+  }, [])
 
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value)
@@ -114,6 +143,7 @@ export function InputBar() {
           value={input}
           onChange={handleInput}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
           placeholder="Type your message... (Enter to send, Shift+Enter for new line)"
           rows={1}
           disabled={isStreaming}
