@@ -122,6 +122,8 @@ export interface BackendMessage {
   role: string
   content: string
   message_type?: string | null
+  image_base64?: string | null
+  image_media_type?: string | null
   tool_calls?: Record<string, unknown>[] | null
   images?: Record<string, unknown>[] | null
   timestamp: number

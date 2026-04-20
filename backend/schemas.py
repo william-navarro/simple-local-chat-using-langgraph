@@ -117,6 +117,8 @@ class MessageOut(BaseModel):
     role: str
     content: str
     message_type: str | None = None
+    image_base64: str | None = None
+    image_media_type: str | None = None
     tool_calls: list[dict] | None = None
     images: list[dict] | None = None
     timestamp: float

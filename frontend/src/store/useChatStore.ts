@@ -330,6 +330,8 @@ export const useChatStore = create<ChatStore>()(
                 role: m.role as Message["role"],
                 content: m.content,
                 messageType: (m.message_type ?? undefined) as Message["messageType"],
+                imageBase64: m.image_base64 ?? undefined,
+                imageMediaType: m.image_media_type ?? undefined,
                 toolCalls: m.tool_calls as unknown as ToolCallInfo[] | undefined,
                 images: m.images as unknown as ImageResult[] | undefined,
                 timestamp: m.timestamp * 1000,
